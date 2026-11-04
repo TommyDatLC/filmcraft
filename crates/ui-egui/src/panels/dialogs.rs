@@ -56,6 +56,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             return;
         }
+        Dialog::EffectSearch => {
+            if !crate::panels::effects_search::show(app, ctx) {
+                app.dialog = None;
+            }
+            return;
+        }
         Dialog::AudioGain => {
             if !audio_gain(app, ctx) {
                 app.dialog = None;

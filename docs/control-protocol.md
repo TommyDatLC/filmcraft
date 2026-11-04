@@ -1,5 +1,59 @@
 # Control protocol & MCP
 
+## Video track effects and preview controls
+
+The local `exponential_zoom` effect's `pivot` is authored in sequence pixels, including
+Apply, Reset Effect and Reset Parameter. Ordinary Transform and clip Vignette Blur points
+use source-picture pixels; a video-track Vignette uses the sequence-sized track picture.
+
+`timeline.selectVideoTrack {"track":"V1"}` selects a video track as the Effect Controls
+target. Track names and ids are accepted. `effects.apply {"track":"V1","effect":"vignette_blur"}`
+adds a native insert to its ordered stack, independently of the current clip selection.
+Use either `track` or the legacy `clip`/`clips` target; mixed targets, audio tracks, missing
+targets and edits on locked tracks fail without changing the document or undo history.
+
+`effects.setParam`, `remove`, `toggleEnabled`, `reset`, `resetParam`, `toggleAnimation`,
+`select` and keyframe commands accept a video `track` instead of `clip`. `effect` identifies
+the first instance by id or an exact stack index; remove/toggle/reset use `index`.
+`effects.reorder {"track":"V1","from":1,"to":0}` moves an insert and preserves selection
+of duplicate instances. Track parameter keys use sequence ticks; clip keys retain the
+clip's effect clock, including speed, reverse and Hold Filters. Keyframe `time` is the
+timeline position; `mediaTime` and stored key times use the target's own clock.
+
+`timeline.setVideoFxBypass {"track":"V1","bypass":true}` bypasses that track's inserts
+and filters on its directly owned clips. It preserves intrinsic Motion, opacity, opacity
+masks, blend modes, audio and transition structure. It leaves nested child stacks and
+each insert's enabled flag intact. The flag is saved and respected by exports.
+Sequence inspection exposes `effects` and `videoEffectsBypassed` on each video track.
+
+Nest and Make Subsequence carry clip-filter bypass into newly created child tracks.
+They reject extraction from affected video tracks owning insert stacks before editing:
+insert migration must preserve sequence-clock keys/procedural timing and avoid applying
+a nest's parent stack twice. Select the complete sequence in the project panel and use
+Duplicate to copy its full track state. Existing independent nested sequences remain
+renderable, and clip extraction from tracks without insert stacks remains supported.
+
+Track inserts support single-frame video filters in sequence coordinates. Intrinsic
+effects, Dynamic Zoom, graphics, temporal filters and filters requiring source metadata
+or another layer are rejected. Unsupported track masks are rejected. Unsupported GPU
+combinations use the CPU reference path, including Lighten/mixed-mode transitions.
+
+`dynamic_zoom` is a single fixed geometry stage immediately after Motion. Its static
+parameters are `start_center`, `end_center` (normalized [x,y], each coordinate -2..3),
+`start_width`, `end_width` (0.01..4), `reverse` and `easing` (0 Linear, 1 Ease In,
+2 Ease Out, 3 Ease In-Out). A second instance, masks and parameter keyframes are rejected.
+Camera progress follows the clip's first/last timeline frames. Reverse swaps the two
+viewports without modifying Motion or source timing.
+
+Stable UI ids include `timeline.track.<id>.effectTarget`, `timeline.track.<id>.fx`,
+`effectControls.track.<id>`, `effectControls.track.<id>.effect.<index>`,
+`effectControls.dynamicZoom.edit`, `.active.start`, `.active.end`, `.reverse`, `.easing`,
+`effectControls.vignetteBlur.showControls` and `program.vignette.center/width/height/rotation/softness`.
+Gizmo drags preview a private snapshot and commit one undoable command group on release;
+Escape, target deletion or selection/revision changes discard the draft.
+Dynamic Zoom Edit displays the selected clip before the camera and opacity stages.
+Preview overlays and draft frames are never exported.
+
 ## Desktop control channel
 `filmcraft --control 9876` (or `FILMCRAFT_CONTROL_PORT`) listens on `127.0.0.1:<port>` (loopback only).
 The listener requires `FILMCRAFT_CONTROL_TOKEN`: 64 random hex characters shared with authorized

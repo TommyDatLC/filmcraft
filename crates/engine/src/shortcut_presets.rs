@@ -367,6 +367,7 @@ pub fn premiere() -> Vec<Entry> {
 
 /// Final Cut Pro's default keys for the equivalent FilmCraft commands.
 pub const FINAL_CUT: &[Entry] = &[
+    ("playback.inToOutPreroll", "Shift+Space", ""),
     ("tool.selection", "A", ""),
     ("tool.razor", "B", ""),
     ("tool.ripple", "T", ""),
@@ -417,6 +418,7 @@ pub const FINAL_CUT: &[Entry] = &[
 
 /// Avid Media Composer's default keys for the equivalent FilmCraft commands.
 pub const AVID: &[Entry] = &[
+    ("playback.inToOutPreroll", "Shift+Space", ""),
     ("playback.reverse", "J", ""),
     ("playback.stop", "K", ""),
     ("playback.forward", "L", ""),

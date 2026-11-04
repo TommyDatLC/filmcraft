@@ -17,13 +17,17 @@ use web_time::Instant;
 
 use filmcraft_engine::previews::PreviewStore;
 use filmcraft_engine::{MediaPool, Services};
-use filmcraft_project::{ItemId, Project};
+use filmcraft_project::{ClipId, ItemId, Project};
 use filmcraft_time::Tick;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     /// Composite of a sequence at a timeline time.
     Sequence(ItemId),
+    /// UI-only input to Dynamic Zoom, isolated after Motion. Its cache never shares final frames.
+    DynamicZoomEdit { sequence: ItemId, clip: ClipId },
+    /// A staged effect edit, rendered from a private snapshot and separate from normal previews.
+    EffectPreview(ItemId),
     /// A single project item at a media time (Source monitor, thumbnails).
     Item(ItemId),
     /// A GPU frame plan of a sequence (decoded layers + transforms), composited on the GPU.
@@ -1118,6 +1122,8 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
             let (w, h, px) = filmcraft_render::render_sequence_rgba8(&job.project, seq, job.time, opts, &provider);
             return (Rgba { w, h, px }, false);
         }
+        Target::DynamicZoomEdit { sequence, clip } => filmcraft_render::dynamic_zoom::edit_frame(&job.project, sequence, clip, job.time, opts, &provider),
+        Target::EffectPreview(sequence) => Some(filmcraft_render::render_sequence(&job.project, sequence, job.time, opts, &provider)),
         Target::Item(item) => filmcraft_render::render_item(&job.project, item, job.time, job.scale, &provider),
         Target::MulticamGrid(item, side, page) => {
             let side = (side > 0).then_some(side as usize);

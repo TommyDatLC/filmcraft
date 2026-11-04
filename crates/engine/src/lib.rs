@@ -17,8 +17,11 @@ pub mod clip_ops;
 pub mod color;
 pub mod commands;
 pub mod demo;
+pub mod dev_logging;
 pub mod doc_path;
+pub mod effect_target;
 pub mod essential_sound;
+pub use effect_target::EffectTarget;
 pub mod export_tools;
 pub mod graphic_templates;
 pub mod graphics;
@@ -59,6 +62,7 @@ pub mod source_monitor;
 pub mod sync;
 pub mod transcript;
 pub mod trim;
+mod video_track_fx;
 pub mod voiceover;
 
 use std::sync::Arc;
@@ -285,9 +289,9 @@ pub struct GapSelection {
 
 /// An effect of a clip (`effects.select`): its id and which of the clip's effects with that id it
 /// is (0 = the first). Not its index, which applying an effect shifts (standard effects go first).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectSel {
-    pub clip: ClipId,
+    pub target: EffectTarget,
     pub effect: String,
     pub instance: usize,
 }
@@ -295,9 +299,20 @@ pub struct EffectSel {
 impl EffectSel {
     /// The selection of `effects[index]` of `clip`.
     pub fn of(clip: ClipId, effects: &[filmcraft_project::EffectInstance], index: usize) -> Option<Self> {
+        Self::of_target(EffectTarget::Clip(clip), effects, index)
+    }
+
+    pub fn clip(&self) -> Option<ClipId> {
+        match self.target {
+            EffectTarget::Clip(id) => Some(id),
+            EffectTarget::VideoTrack(_) => None,
+        }
+    }
+
+    pub fn of_target(target: EffectTarget, effects: &[filmcraft_project::EffectInstance], index: usize) -> Option<Self> {
         let id = &effects.get(index)?.effect;
         let instance = effects.iter().take(index).filter(|e| &e.effect == id).count();
-        Some(Self { clip, effect: id.clone(), instance })
+        Some(Self { target, effect: id.clone(), instance })
     }
 
     /// Where the selected effect is in the clip's `effects`.
@@ -321,6 +336,9 @@ pub struct EditorState {
     pub source_history: Vec<ItemId>,
     /// Selected timeline items.
     pub selection: Vec<ClipId>,
+    /// Explicit target of the Effect Controls inspector.
+    #[serde(default)]
+    pub effect_controls_target: Option<EffectTarget>,
     /// Selected project panel items.
     pub project_selection: Vec<ItemId>,
     pub targeting: std::collections::BTreeMap<ItemId, Targeting>,
@@ -441,6 +459,7 @@ pub enum Event {
 }
 
 pub struct Session {
+    pub dev_log: dev_logging::DevLogger,
     pub project: Arc<Project>,
     /// Runtime identity of the opened project, stable across edits/undo and renewed on replacement.
     pub project_instance: Arc<()>,
@@ -568,6 +587,7 @@ impl Default for Session {
 impl Session {
     pub fn new(services: Arc<dyn Services>) -> Self {
         Self {
+            dev_log: Default::default(),
             project: Arc::new(Project::new("Untitled")),
             project_instance: Arc::new(()),
             history: History { limit: 200, ..Default::default() },
@@ -745,6 +765,19 @@ impl Session {
         }
     }
 
+    /// Remember an applied effect without changing the project or its undo history.
+    pub(crate) fn note_recent_effect(&mut self, effect: &str) {
+        let mut prefs = self.prefs.clone();
+        prefs.recent_effects.retain(|id| id != effect);
+        prefs.recent_effects.insert(0, effect.to_string());
+        prefs.recent_effects.truncate(10);
+        if let Err(error) = self.set_prefs(prefs) {
+            let message = format!("Effect applied, but recent effects could not be saved: {error}");
+            self.log.push(panels::Level::Warning, "effects.apply", message.clone());
+            self.events.push(Event::Toast { message, error: true });
+        }
+    }
+
     /// Keep render previews next to the saved project (moves an unsaved project's previews).
     pub fn previews_follow_path(&mut self) {
         if let Some(p) = &self.path
@@ -809,6 +842,15 @@ impl Session {
         if outermost {
             self.command_origin = None;
         }
+        if r.is_ok()
+            && let Some(target) = self.state.effect_controls_target
+            && self.active_sequence().is_none_or(|q| effect_target::effects(q, target).is_err())
+        {
+            self.state.effect_controls_target = None;
+            if self.state.selected_effect.as_ref().is_some_and(|e| e.target == target) {
+                self.state.selected_effect = None;
+            }
+        }
         if self.exec_depth == 0 {
             source_monitor::track_history(self);
         }
@@ -833,6 +875,13 @@ impl Session {
         self.sync_persistence();
         // playback reads the newest snapshot (mixer moves, mutes… are heard while playing)
         self.previews.live.publish_project(self.project.clone());
+        if spec.journal && !id.starts_with("dev.logging.") {
+            let window = format!("FilmCraft - {}", self.project.name);
+            if let Err(error) = self.dev_log.record(id, spec.label, &params, r.is_ok(), &window) {
+                self.dev_log.disable();
+                self.log.push(panels::Level::Warning, "dev.logging", error.to_string());
+            }
+        }
         if r.is_ok() && journal {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {
@@ -1139,7 +1188,7 @@ impl Session {
             }
         }
         if let Some(e) = &self.state.selected_effect
-            && self.active_sequence().and_then(|q| q.find_item(e.clip)).and_then(|(_, it)| e.index(&it.effects)).is_none()
+            && self.active_sequence().and_then(|q| effect_target::effects(q, e.target).ok()).and_then(|effects| e.index(effects)).is_none()
         {
             self.state.selected_effect = None;
         }
@@ -1162,6 +1211,11 @@ impl Session {
         } else {
             self.state.selection.clear();
             self.state.caption_selection.clear();
+        }
+        if let Some(target) = self.state.effect_controls_target
+            && self.active_sequence().is_none_or(|q| effect_target::effects(q, target).is_err())
+        {
+            self.state.effect_controls_target = None;
         }
         self.state.project_selection.retain(|i| p.item(*i).is_some());
         self.drop_stale_gap();
@@ -1469,3 +1523,9 @@ mod source_placement_tests;
 mod frame_export_tests;
 #[cfg(test)]
 mod wasm_clock_tests;
+
+#[cfg(test)]
+mod video_track_fx_tests;
+
+#[cfg(test)]
+mod dynamic_zoom_tests;

@@ -3672,3 +3672,11 @@
 	Previous	Anterior
 	Next	Próximo
 	Enter a valid HH:MM:SS:FF timecode	Digite um timecode válido HH:MM:SS:FF
+
+# Custom video effects and preview controls
+	Recently used	Usados recentemente
+	No effects found.	Nenhum efeito encontrado.
+	Select clips to apply an effect.	Selecione clipes para aplicar um efeito.
+	Select compatible clips to apply this effect.	Selecione clipes compatíveis para aplicar este efeito.
+	Dev Logging	Registro de desenvolvimento
+	Developer	Desenvolvedor

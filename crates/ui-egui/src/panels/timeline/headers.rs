@@ -187,11 +187,7 @@ pub(super) fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequ
                 *h = (*h + d).clamp(22.0, 220.0);
             }
         }
-        let resp = ui.interact(
-            Rect::from_min_max(pos2(hrect.min.x + 90.0, hrect.min.y + 26.0), hrect.max).intersect(visible),
-            egui::Id::unique(("hdr", r.track.0)),
-            Sense::click(),
-        );
+        let resp = track_header_target(app, ui, tr, (hrect, visible), t, &mut actions);
         if resp.double_clicked() {
             let h = if r.kind == TrackKind::Video { &mut app.ui.timeline.video_track_h } else { &mut app.ui.timeline.audio_track_h };
             *h = if *h < 50.0 { 64.0 } else { 30.0 };
@@ -199,11 +195,7 @@ pub(super) fn draw_headers(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequ
     }
     // column separator
     ui.painter().line_segment([pos2(rect.min.x + hw - 0.5, vclip.min.y), pos2(rect.min.x + hw - 0.5, aclip.max.y + MASTER_H)], Stroke::new(1.0, t.separator));
-    for (cmd, params) in actions {
-        if let Err(e) = app.session.execute(&cmd, params) {
-            app.ui.status = e.to_string();
-        }
-    }
+    apply_header_actions(app, actions);
     run_track_menu(app, ui, header_menu);
     if let Some(a) = vo_action {
         crate::panels::voiceover::run(app, &ui.ctx().clone(), a);
@@ -252,6 +244,18 @@ fn header_line_buttons(
         if eresp.clicked() {
             actions.push(("timeline.setTrack".into(), json!({"track": r.track.0, "enabled": !tr.enabled})));
         }
+        let fx = Rect::from_center_size(pos2(hrect.min.x + 152.0, upper_y), vec2(24.0, 18.0)).intersect(visible);
+        let fx_resp = ui
+            .interact(fx, egui::Id::unique(("video-track-fx", tr.id.0)), Sense::click())
+            .on_hover_text("Bypass track and clip effects (keeps Motion, opacity and blending)");
+        ui.painter().text(fx.center(), Align2::CENTER_CENTER, "FX", Tokens::semibold(10.0), if tr.video_effects_bypassed { t.text_faint } else { t.accent });
+        if tr.video_effects_bypassed {
+            ui.painter().line_segment([fx.left_bottom(), fx.right_top()], Stroke::new(1.0, t.text_faint));
+        }
+        app.auto.add_response(&format!("timeline.track.{}.fx", tr.id.0), &fx_resp, "Bypass Video Effects");
+        if fx_resp.clicked() {
+            actions.push(("timeline.setVideoFxBypass".into(), json!({"track":tr.id.0,"bypass":!tr.video_effects_bypassed})));
+        }
     } else {
         let mr = Rect::from_center_size(pos2(hrect.min.x + x, upper_y), vec2(14.0, 14.0));
         let mresp = crate::widgets::letter_toggle_clipped(
@@ -281,5 +285,47 @@ fn header_line_buttons(
         }
         let kr = small(x + 64.0, upper_y);
         crate::panels::timeline_automation::header_button(app, ui, seq, r, kr, visible, label, t);
+    }
+}
+
+fn track_header_target(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    tr: &filmcraft_project::Track,
+    area: (Rect, Rect),
+    t: &Tokens,
+    actions: &mut Vec<(String, Value)>,
+) -> egui::Response {
+    let (hrect, visible) = area;
+    let p = ui.painter().with_clip_rect(visible);
+    let target_rect = if hrect.height() >= 40.0 {
+        Rect::from_min_max(pos2(hrect.min.x + 90.0, hrect.min.y + 26.0), pos2(hrect.max.x, hrect.max.y - 4.0))
+    } else {
+        Rect::from_min_max(pos2(hrect.min.x + 170.0, hrect.min.y + 4.0), pos2(hrect.max.x - 4.0, hrect.max.y - 4.0))
+    }
+    .intersect(visible);
+    let resp = ui.interact(target_rect, egui::Id::unique(("hdr", tr.id.0)), Sense::click());
+    if tr.kind == TrackKind::Video {
+        app.auto.add_response(&format!("timeline.track.{}.effectTarget", tr.id.0), &resp, &format!("Track: {}", tr.name));
+        if hrect.height() < 40.0 {
+            p.text(target_rect.left_center(), Align2::LEFT_CENTER, &tr.name, Tokens::ui(10.0), t.text_dim);
+        }
+        if app.session.state.effect_controls_target == Some(filmcraft_engine::EffectTarget::VideoTrack(tr.id)) {
+            p.line_segment([target_rect.left_bottom(), target_rect.right_bottom()], Stroke::new(2.0, t.accent));
+        }
+        if resp.clicked() {
+            actions.push(("timeline.selectVideoTrack".into(), json!({"track":tr.id.0})));
+        }
+    }
+    resp
+}
+
+fn apply_header_actions(app: &mut FilmcraftApp, actions: Vec<(String, Value)>) {
+    for (cmd, params) in actions {
+        if let Err(e) = app.session.execute(&cmd, params) {
+            app.ui.status = e.to_string();
+        } else if cmd == "timeline.selectVideoTrack" {
+            app.show_panel(crate::dock::PanelKind::EffectControls);
+        }
     }
 }

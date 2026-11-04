@@ -163,6 +163,14 @@ pub fn video_segments(project: &Project, seq_id: ItemId) -> Vec<Segment> {
         let mut clips = Vec::new();
         let mut absolute = false;
         for l in &layers {
+            let ti = match l {
+                Layer::Item(ti, _) | Layer::Transition(ti, _, _, _) => *ti,
+            };
+            if let Some(track) = seq.video_tracks.get(ti) {
+                h.json(&("videoTrackFx", &track.effects, track.video_effects_bypassed));
+                // Conservatively include sequence time for procedural inserts as well as keys.
+                absolute |= crate::video_track_fx::has_stack(track, crate::RenderOptions::default());
+            }
             match l {
                 Layer::Item(ti, it) => {
                     h.json(&("item", ti));
@@ -365,7 +373,7 @@ fn hash_source(h: &mut Fnv128, project: &Project, id: ItemId, kind: TrackKind, d
             // a nested sequence's captions are drawn into its picture
             h.json(&("captions", &s.caption_tracks));
             for (ti, tr) in s.video_tracks.iter().enumerate() {
-                h.json(&("track", ti, tr.enabled, tr.items.len()));
+                h.json(&("track", ti, tr.enabled, tr.items.len(), &tr.effects, tr.video_effects_bypassed));
                 for it in &tr.items {
                     hash_item(h, project, it, Tick::ZERO, kind, depth + 1);
                 }
@@ -411,6 +419,10 @@ pub fn effect_cost_ms(id: &str) -> f64 {
         | "bokeh_blur"
         | "compound_blur"
         | "focus_blur"
+        | "three_layer_bloom"
+        | "exponential_bloom"
+        | "vignette_blur"
+        | "screen_effect"
         | "channel_blur"
         | "turbulent_displace"
         | "warp_stabilizer"
@@ -470,43 +482,62 @@ fn decode_cost_ms(project: &Project, id: ItemId, depth: u32) -> f64 {
                 .video_tracks
                 .iter()
                 .filter(|t| t.enabled)
-                .flat_map(|t| t.items.iter())
-                .map(|it| decode_cost_ms(project, it.item, depth + 1) + item_fx_cost(it, 1.0))
+                .flat_map(|track| {
+                    track.items.iter().filter(|it| it.enabled).map(move |it| {
+                        decode_cost_ms(project, it.item, depth + 1)
+                            + if track.video_effects_bypassed { 0.0 } else { item_fx_cost(it, 1.0) }
+                            + track_fx_cost(track, 1.0)
+                    })
+                })
                 .fold(0.0, f64::max);
             10.0 + id_cost
         }
     }
 }
 
+fn track_fx_cost(track: &filmcraft_project::Track, px: f64) -> f64 {
+    if track.video_effects_bypassed {
+        return 0.0;
+    }
+    track.effects.iter().filter(|e| e.enabled && e.def().is_some_and(filmcraft_project::video_fx::supports_track)).map(|e| effect_cost_ms(&e.effect) * px).sum()
+}
+
 fn item_fx_cost(it: &TrackItem, px: f64) -> f64 {
     it.effects.iter().filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)).map(|e| effect_cost_ms(&e.effect) * px).sum()
 }
 
-fn cpu_layer(project: &Project, it: &TrackItem) -> bool {
-    let fx = it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks();
+fn cpu_layer(project: &Project, it: &TrackItem, filters: bool) -> bool {
+    let fx = filters && it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks();
     let blend = crate::opacity_blend(it, it.source_in).1 != crate::Blend::Normal;
     let nested = project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Sequence(_)));
     fx || blend || nested
 }
 
-fn layer_cost(project: &Project, it: &TrackItem, px: f64, force_cpu: bool) -> f64 {
+fn layer_cost(project: &Project, it: &TrackItem, px: f64, force_cpu: bool, filters: bool) -> f64 {
     if project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::AdjustmentLayer { .. })) {
-        return 10.0 * px + item_fx_cost(it, px);
+        return if filters { 10.0 * px + item_fx_cost(it, px) } else { 0.0 };
     }
     let decode = decode_cost_ms(project, it.item, 0);
-    let path = if force_cpu || cpu_layer(project, it) { 10.0 * px } else { 0.5 };
-    decode + path + item_fx_cost(it, px)
+    let path = if force_cpu || cpu_layer(project, it, filters) { 10.0 * px } else { 0.5 };
+    decode + path + if filters { item_fx_cost(it, px) } else { 0.0 }
 }
 
 fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer]) -> f64 {
     let px = (seq.settings.width as f64 * seq.settings.height as f64) / HD_PIXELS;
     let mut total = 0.0;
     for l in layers {
+        let ti = match l {
+            Layer::Item(ti, _) | Layer::Transition(ti, _, _, _) => *ti,
+        };
+        let track = seq.video_tracks.get(ti);
+        let filters = track.is_none_or(|t| !t.video_effects_bypassed);
+        let force_cpu = track.is_some_and(|t| t.video_effects_bypassed || crate::video_track_fx::has_stack(t, crate::RenderOptions::default()));
+        let stack_cost = track.map_or(0.0, |track| track_fx_cost(track, px));
         total += match l {
-            Layer::Item(_, it) => layer_cost(project, it, px, false),
+            Layer::Item(_, it) => layer_cost(project, it, px, force_cpu, filters) + stack_cost,
             Layer::Transition(_, x, a, b) => {
                 let simple = matches!(x.effect.effect.as_str(), "cross_dissolve" | "dip_to_black" | "dip_to_white" | "non_additive_dissolve");
-                let sides: f64 = [a, b].iter().filter_map(|s| s.map(|it| layer_cost(project, it, px, !simple))).sum();
+                let sides: f64 = [a, b].iter().filter_map(|s| s.map(|it| layer_cost(project, it, px, !simple || force_cpu, filters) + stack_cost)).sum();
                 sides + if simple { 1.0 } else { 12.0 * px }
             }
         };
@@ -517,6 +548,9 @@ fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer]) -> f64 {
 /// A single clip that plays natively: no standard effects, untouched fixed effects, normal speed,
 /// source frame size and rate equal to the sequence's.
 fn native(project: &Project, seq: &Sequence, it: &TrackItem) -> bool {
+    if seq.find_item(it.id).and_then(|(id, _)| seq.track(id)).is_some_and(|t| crate::video_track_fx::has_stack(t, crate::RenderOptions::default())) {
+        return false;
+    }
     if it.has_standard_effects() || it.has_modified_intrinsics() || (it.speed - 1.0).abs() > 1e-9 || it.reverse || it.frame_hold.is_some() {
         return false;
     }

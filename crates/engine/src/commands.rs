@@ -327,7 +327,7 @@ pub(crate) fn clip_p(p: &Value, k: &str) -> Option<ClipId> {
 /// Effect by id or display name. Names shared by several definitions ("Invert", "Volume",
 /// "Channel Volume") resolve to an applicable (non-intrinsic) effect whose kind matches the
 /// target clips' tracks.
-fn resolve_effect_name(s: &Session, p: &Value, name: &str) -> Option<&'static filmcraft_project::EffectDef> {
+pub(crate) fn resolve_effect_name(s: &Session, p: &Value, name: &str) -> Option<&'static filmcraft_project::EffectDef> {
     if let Some(d) = filmcraft_project::find_effect(name) {
         return Some(d);
     }
@@ -1463,6 +1463,9 @@ fn marker_list_mut(s: &mut Session) -> Result<(ItemId, Tick)> {
 /// Builds the command registry shared by the UI, CLI and control interfaces.
 fn build() -> Vec<CommandSpec> {
     let mut v = vec![
+        query!("dev.logging.status", "Dev Logging Status", r#"{}"#, |s, _| Ok(s.dev_log.status())),
+        cmd!("dev.logging.set", "Configure Dev Logging", [], None, r#"{"enabled":bool?,"path":str?}"#, always, crate::dev_logging::set_logging),
+        cmd!("dev.logging.toggle", "Dev Logging", ["Window", "Developer"], Some("Cmd+Shift+F12"), r#"{}"#, always, crate::dev_logging::set_logging),
         // ================= File =================
         cmd!("file.newProject", "Project…", ["File", "New"], Some("Cmd+Alt+N"), r#"{"name":str}"#, always, |s, p| {
             let name = str_p(p, "name").unwrap_or("Untitled").to_string();
@@ -2125,11 +2128,13 @@ fn build() -> Vec<CommandSpec> {
         cmd!("edit.selectAll", "Select All", ["Edit"], Some("Cmd+A"), "{}", has_seq, |s, _| {
             let all: Vec<ClipId> = s.active_sequence().map(|q| q.all_tracks().flat_map(|t| t.items.iter().map(|i| i.id)).collect()).unwrap_or_default();
             s.state.selection = all;
+            s.state.effect_controls_target = None;
             s.state.gap_selection = None;
             Ok(json!({"selected": s.state.selection.len()}))
         }),
         cmd!("edit.deselectAll", "Deselect All", ["Edit"], Some("Cmd+Shift+A"), "{}", always, |s, _| {
             s.state.selection.clear();
+            s.state.effect_controls_target = None;
             s.state.caption_selection.clear();
             s.state.gap_selection = None;
             Ok(Value::Null)
@@ -3165,6 +3170,7 @@ fn build() -> Vec<CommandSpec> {
             }
         ),
         cmd!("timeline.select", "Select Clips", [], None, r#"{"clips":[id],"transitions":[id]?,"add":bool,"toggle":bool,"linked":bool?}"#, has_seq, |s, p| {
+            s.state.effect_controls_target = None;
             if let Some(ids) = p.get("transitions") {
                 return select_transitions(s, ids, bool_p(p, "add").unwrap_or(false), bool_p(p, "toggle").unwrap_or(false));
             }
@@ -3511,7 +3517,10 @@ fn build() -> Vec<CommandSpec> {
             Ok(Value::Null)
         }),
         // ================= Effects =================
-        cmd!("effects.apply", "Apply Effect", [], None, r#"{"clips":[id]?,"effect":"gaussian_blur|Gaussian Blur|…"}"#, has_seq, |s, p| {
+        cmd!("effects.apply", "Apply Effect", [], None, r#"{"clips":[id]?|"track":id,"effect":"gaussian_blur|Gaussian Blur|…"}"#, has_seq, |s, p| {
+            if p.get("track").is_some() {
+                return crate::video_track_fx::apply(s, p);
+            }
             let name = str_p(p, "effect").ok_or_else(|| bad("effects.apply", "need `effect`"))?;
             let def = resolve_effect_name(s, p, name).ok_or_else(|| bad("effects.apply", format!("unknown effect `{name}`")))?;
             if filmcraft_project::graphic::is_layer_id(def.id) {
@@ -3520,7 +3529,10 @@ fn build() -> Vec<CommandSpec> {
             if matches!(def.kind, filmcraft_project::EffectKind::VideoTransition | filmcraft_project::EffectKind::AudioTransition) {
                 let mut q = p.clone();
                 q["effect"] = json!(def.id);
-                return apply_transition(s, &q, if def.kind == filmcraft_project::EffectKind::VideoTransition { TrackKind::Video } else { TrackKind::Audio });
+                let result =
+                    apply_transition(s, &q, if def.kind == filmcraft_project::EffectKind::VideoTransition { TrackKind::Video } else { TrackKind::Audio })?;
+                s.note_recent_effect(def.id);
+                return Ok(result);
             }
             let clips = clips_p(s, p);
             if clips.is_empty() {
@@ -3553,14 +3565,17 @@ fn build() -> Vec<CommandSpec> {
                     for i in t.items.iter_mut().filter(|i| clips.contains(&i.id)) {
                         let mut inst = def.instance();
                         let size = source_sizes.get(&i.id).copied().unwrap_or((fw, fh));
-                        // intrinsic effects (Motion) are laid out in the sequence frame, as `reset_params` does
-                        let frame = if def.intrinsic { (fw, fh) } else { size };
+                        // Motion and the custom zoom's sequence-space pivot use the sequence frame.
+                        let frame = if def.intrinsic || def.id == "exponential_zoom" { (fw, fh) } else { size };
                         resolve_auto_points(&mut inst, frame, size);
-                        // at the end of the stack, as in Premiere, so the indices already
-                        // handed out (graphics.list effectIndex…) stay valid (#1879); the
-                        // renderer applies the intrinsic ones after the standard ones anyway
+                        if def.id == "dynamic_zoom" && i.effects.iter().any(|e| e.effect == "dynamic_zoom") {
+                            return Err(bad("effects.apply", "this clip already has Dynamic Zoom"));
+                        }
+                        crate::effect_target::validate_geometry(&inst)?;
+                        // Appending keeps existing effect indices stable. The renderer finds Dynamic
+                        // Zoom by ID and composes its geometry after Motion.
+                        let pos = i.effects.len();
                         i.effects.push(inst);
-                        let pos = i.effects.len() - 1;
                         applied.push(json!({"clip": i.id.0, "index": pos, "effect": def.id}));
                     }
                 }
@@ -3570,14 +3585,20 @@ fn build() -> Vec<CommandSpec> {
                 }
                 Ok(applied)
             })?;
+            if !applied.is_empty() {
+                s.note_recent_effect(def.id);
+            }
             Ok(json!({"applied": applied}))
         }),
-        cmd!("effects.remove", "Remove Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
+        cmd!("effects.remove", "Remove Effect", [], None, r#"{"clip":id|"track":id,"index":n}"#, has_seq, |s, p| {
+            if p.get("track").is_some() {
+                return crate::video_track_fx::remove(s, p);
+            }
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.remove", "need `clip`"))?;
             let idx = u64_p(p, "index").ok_or_else(|| bad("effects.remove", "need `index`"))? as usize;
             // the selected effect: where it is, and its selection once the effect at `idx` is gone
             let effects = s.active_sequence().and_then(|q| q.find_item(c)).map(|(_, it)| it.effects.clone()).unwrap_or_default();
-            let sel = s.state.selected_effect.clone().filter(|e| e.clip == c).and_then(|e| e.index(&effects));
+            let sel = s.state.selected_effect.clone().filter(|e| e.clip() == Some(c)).and_then(|e| e.index(&effects));
             let after = sel.filter(|i| *i != idx).and_then(|i| {
                 let mut rest = effects;
                 if idx < rest.len() {
@@ -3605,7 +3626,7 @@ fn build() -> Vec<CommandSpec> {
             label: "Select Effect",
             menu: &[],
             shortcut: None,
-            params: r#"{"clip":id,"effect":index|id}|{"none":true}"#,
+            params: r#"{"clip":id|"track":id,"effect":index|id}|{"none":true}"#,
             enabled: has_seq,
             run: select_effect,
             journal: false,
@@ -3615,9 +3636,12 @@ fn build() -> Vec<CommandSpec> {
             "Set Effect Parameter",
             [],
             None,
-            r##"{"clip":id,"effect":"motion"|index,"param":str,"mask":n?,"value":num|[x,y]|"#rrggbb"|bool|path|"option name" (a choice takes its index or its name),"time":ticks? (where the keyframe goes when the parameter is animated, kept there even outside the clip; default: the playhead, pinned to the clip; a parameter that is not animated gets a new static value whatever the time),"keyframe":bool? (true: write a keyframe at `time` and animate the parameter),"merge":bool|key?,"begin":bool?}"##,
+            r##"{"clip":id|"track":id,"effect":"motion"|index,"param":str,"mask":n?,"value":num|[x,y]|"#rrggbb"|bool|path|"option name" (a choice takes its index or its name),"time":ticks? (where the keyframe goes when the parameter is animated, kept there even outside the clip; default: the playhead, pinned to the clip; a parameter that is not animated gets a new static value whatever the time),"keyframe":bool? (true: write a keyframe at `time` and animate the parameter),"merge":bool|key?,"begin":bool?}"##,
             has_seq,
             |s, p| {
+                if p.get("track").is_some() {
+                    return crate::video_track_fx::set_param(s, p);
+                }
                 let c = clip_p(p, "clip").ok_or_else(|| bad("effects.setParam", "need `clip`"))?;
                 let pid = str_p(p, "param").ok_or_else(|| bad("effects.setParam", "need `param`"))?.to_string();
                 let val = p.get("value").cloned().ok_or_else(|| bad("effects.setParam", "need `value`"))?;
@@ -3628,6 +3652,25 @@ fn build() -> Vec<CommandSpec> {
                 let at = time_p(s, p, "");
                 let ph = s.playhead();
                 let pq = p.clone();
+                // Validate the automatic geometry before `begin` can reset an active gesture.
+                if let Some((_, item)) = s.active_sequence().and_then(|q| q.find_item(c)) {
+                    let e = match &eff {
+                        Value::Number(n) => n.as_u64().and_then(|i| usize::try_from(i).ok()).and_then(|i| item.effects.get(i)),
+                        Value::String(id) => item.effects.iter().find(|e| &e.effect == id),
+                        _ => None,
+                    };
+                    if let Some(e) = e.filter(|e| e.effect == "dynamic_zoom") {
+                        if keyframe || p.get("mask").is_some_and(|v| !v.is_null()) {
+                            return Err(bad("effects.setParam", "Dynamic Zoom has static viewports and no masks"));
+                        }
+                        let def = e.def().and_then(|d| d.param(&pid)).ok_or_else(|| bad("effects.setParam", "unknown Dynamic Zoom parameter"))?;
+                        let value = crate::video_track_fx::value_for(def, &val)?;
+                        let mut candidate = e.clone();
+                        candidate.params.entry(pid.clone()).or_insert_with(|| filmcraft_project::Param::new(def.default.clone())).value = value;
+                        crate::effect_target::validate_geometry(&candidate)?;
+                    }
+                }
+
                 // `merge`: a drag of one parameter is one undo step (#201), and a key makes one of a
                 // drag that changes several (the Program monitor's handles); `begin` starts a new one
                 let merge = match p.get("merge") {
@@ -3707,13 +3750,17 @@ fn build() -> Vec<CommandSpec> {
                             }
                         }
                     }
+                    crate::effect_target::validate_geometry(e)?;
                     Ok((keyframes, accepted_value))
                 })?;
                 // 0 keyframes: the value is static (`time` was not used)
                 Ok(json!({"keyframes": keyframes, "param": pid, "value": value}))
             }
         ),
-        cmd!("effects.toggleAnimation", "Toggle Animation", [], None, r#"{"clip":id,"effect":str|index,"param":str,"mask":n?}"#, has_seq, |s, p| {
+        cmd!("effects.toggleAnimation", "Toggle Animation", [], None, r#"{"clip":id|"track":id,"effect":str|index,"param":str,"mask":n?}"#, has_seq, |s, p| {
+            if p.get("track").is_some() {
+                return crate::video_track_fx::toggle_animation(s, p);
+            }
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleAnimation", "need `clip`"))?;
             let pid = str_p(p, "param").ok_or_else(|| bad("effects.toggleAnimation", "need `param`"))?.to_string();
             let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
@@ -3727,6 +3774,9 @@ fn build() -> Vec<CommandSpec> {
                     _ => None,
                 }
                 .ok_or_else(|| bad("effects.toggleAnimation", "no such effect"))?;
+                if e.effect == "dynamic_zoom" {
+                    return Err(bad("effects.toggleAnimation", "Dynamic Zoom uses automatic viewport interpolation"));
+                }
                 // a parameter an older instance lacks (added to the effect later) starts from its
                 // default, as the UI shows it, without touching an existing one
                 if p.get("mask").is_none_or(Value::is_null)
@@ -3740,7 +3790,10 @@ fn build() -> Vec<CommandSpec> {
             })?;
             Ok(Value::Null)
         }),
-        cmd!("effects.toggleEnabled", "Toggle Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
+        cmd!("effects.toggleEnabled", "Toggle Effect", [], None, r#"{"clip":id|"track":id,"index":n}"#, has_seq, |s, p| {
+            if p.get("track").is_some() {
+                return crate::video_track_fx::toggle_enabled(s, p);
+            }
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleEnabled", "need `clip`"))?;
             let idx = u64_p(p, "index").unwrap_or(0) as usize;
             s.edit_sequence("Toggle Effect", |q, _, _| {
@@ -3752,7 +3805,10 @@ fn build() -> Vec<CommandSpec> {
             })?;
             Ok(Value::Null)
         }),
-        cmd!("effects.reset", "Reset Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
+        cmd!("effects.reset", "Reset Effect", [], None, r#"{"clip":id|"track":id,"index":n}"#, has_seq, |s, p| {
+            if p.get("track").is_some() {
+                return crate::video_track_fx::reset(s, p);
+            }
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.reset", "need `clip`"))?;
             let idx = u64_p(p, "index").unwrap_or(0) as usize;
             let frame = s.active_sequence().map(|q| (q.settings.width, q.settings.height)).unwrap_or((1920, 1080));
@@ -3763,12 +3819,16 @@ fn build() -> Vec<CommandSpec> {
                 let mt = it.effect_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
                 if let Some(e) = it.effects.get_mut(idx) {
                     reset_params(e, None, frame, source, mt);
+                    crate::effect_target::validate_geometry(e)?;
                 }
                 Ok(())
             })?;
             Ok(Value::Null)
         }),
-        cmd!("effects.resetParam", "Reset Parameter", [], None, r#"{"clip":id,"effect":str|index,"param":str}"#, has_seq, |s, p| {
+        cmd!("effects.resetParam", "Reset Parameter", [], None, r#"{"clip":id|"track":id,"effect":str|index,"param":str}"#, has_seq, |s, p| {
+            if p.get("track").is_some() {
+                return crate::video_track_fx::reset_param(s, p);
+            }
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.resetParam", "need `clip`"))?;
             let pid = str_p(p, "param").ok_or_else(|| bad("effects.resetParam", "need `param`"))?.to_string();
             let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
@@ -3787,6 +3847,7 @@ fn build() -> Vec<CommandSpec> {
                 if !reset_params(e, Some(&pid), frame, source, mt) {
                     return Err(bad("effects.resetParam", format!("no param `{pid}`")));
                 }
+                crate::effect_target::validate_geometry(e)?;
                 Ok(())
             })?;
             Ok(Value::Null)
@@ -3796,19 +3857,25 @@ fn build() -> Vec<CommandSpec> {
             "Add/Remove Keyframe",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mask":n?,"time":ticks?}"#,
+            r#"{"clip":id|"track":id,"effect":str|index,"param":str,"mask":n?,"time":ticks?}"#,
             has_seq,
             |s, p| { keyframe_op(s, p, "add") }
         ),
-        cmd!("effects.deleteKeyframe", "Delete Keyframe", [], None, r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks}"#, has_seq, |s, p| {
-            keyframe_op(s, p, "delete")
-        }),
+        cmd!(
+            "effects.deleteKeyframe",
+            "Delete Keyframe",
+            [],
+            None,
+            r#"{"clip":id|"track":id,"effect":str|index,"param":str,"mediaTime":ticks}"#,
+            has_seq,
+            |s, p| { keyframe_op(s, p, "delete") }
+        ),
         cmd!(
             "effects.moveKeyframe",
             "Move Keyframe",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"to":ticks,"value":any?,"merge":bool?,"begin":bool?}"#,
+            r#"{"clip":id|"track":id,"effect":str|index,"param":str,"mediaTime":ticks,"to":ticks,"value":any?,"merge":bool?,"begin":bool?}"#,
             has_seq,
             |s, p| keyframe_op(s, p, "move")
         ),
@@ -3817,7 +3884,7 @@ fn build() -> Vec<CommandSpec> {
             "Move Keyframes",
             [],
             None,
-            r#"{"keyframes":[{"clip":id,"effect":index,"param":str,"mask":n?,"time":mediaTicks}],"delta":timelineTicks}"#,
+            r#"{"keyframes":[{"clip":id|"track":id,"effect":index,"param":str,"mask":n?,"time":mediaTicks}],"delta":timelineTicks}"#,
             has_seq,
             crate::keyframe_move::move_many
         ),
@@ -3826,7 +3893,7 @@ fn build() -> Vec<CommandSpec> {
             "Keyframe Interpolation",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}|{"keyframes":[{"clip":id,"effect":index,"param":str,"mask":n?,"time":mediaTicks}],"interpolation":str}"#,
+            r#"{"clip":id|"track":id,"effect":str|index,"param":str,"mediaTime":ticks,"interpolation":"linear|bezier|autoBezier|continuousBezier|hold|easeIn|easeOut"}|{"keyframes":[{"clip":id,"effect":index,"param":str,"mask":n?,"time":mediaTicks}],"interpolation":str}"#,
             has_seq,
             |s, p| if p.get("keyframes").is_some() { crate::keyframe_move::interpolate_many(s, p) } else { keyframe_op(s, p, "interp") }
         ),
@@ -3835,7 +3902,7 @@ fn build() -> Vec<CommandSpec> {
             "Edit Keyframe",
             [],
             None,
-            r#"{"clip":id,"effect":str|index,"param":str,"mediaTime":ticks,"value":any?,"inInfluence":0..1?,"outInfluence":0..1?,"merge":bool?,"begin":bool?}"#,
+            r#"{"clip":id|"track":id,"effect":str|index,"param":str,"mediaTime":ticks,"value":any?,"inInfluence":0..1?,"outInfluence":0..1?,"merge":bool?,"begin":bool?}"#,
             has_seq,
             |s, p| keyframe_op(s, p, "set")
         ),
@@ -4028,6 +4095,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::captions::commands());
     v.extend(crate::settings::commands());
     v.extend(crate::mixer::commands());
+    v.extend(crate::video_track_fx::commands());
     v.extend(crate::multicam::commands());
     v.extend(crate::essential_sound::commands());
     v.extend(crate::color::commands());
@@ -4064,10 +4132,10 @@ fn build() -> Vec<CommandSpec> {
 /// animated one keeps its keyframes and gets the default as a keyframe at media time `mt`.
 /// Masks are left alone. Returns whether any parameter was reset. "Auto" points are centred as
 /// when the effect was added: a standard effect's in the clip's `source` picture it runs on.
-fn reset_params(e: &mut filmcraft_project::EffectInstance, only: Option<&str>, frame: (u32, u32), source: (u32, u32), mt: Tick) -> bool {
+pub(crate) fn reset_params(e: &mut filmcraft_project::EffectInstance, only: Option<&str>, frame: (u32, u32), source: (u32, u32), mt: Tick) -> bool {
     let Some(d) = e.def() else { return false };
     let mut fresh = d.instance();
-    resolve_auto_points(&mut fresh, if d.intrinsic { frame } else { source }, source);
+    resolve_auto_points(&mut fresh, if d.intrinsic || d.id == "exponential_zoom" { frame } else { source }, source);
     let mut any = false;
     for (id, prm) in fresh.params {
         if only.is_some_and(|o| o != id) {
@@ -4075,11 +4143,14 @@ fn reset_params(e: &mut filmcraft_project::EffectInstance, only: Option<&str>, f
         }
         any = true;
         match e.params.get_mut(&id) {
-            Some(old) if old.is_animated() => old.set_at(mt, prm.value),
+            Some(old) if old.is_animated() && e.effect != "dynamic_zoom" => old.set_at(mt, prm.value),
             _ => {
                 e.params.insert(id, prm);
             }
         }
+    }
+    if e.effect == "dynamic_zoom" && only.is_none() {
+        e.masks.clear();
     }
     any
 }
@@ -4103,7 +4174,11 @@ pub(crate) fn interpolation_p(p: &Value) -> filmcraft_project::Interpolation {
 /// whether it added the keyframe or (it is a toggle) removed the one there, and the media time of
 /// that keyframe. `delete` replies `{removed}`: whether a keyframe sat exactly at `mediaTime`.
 fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
-    let c = clip_p(p, "clip").ok_or_else(|| bad("keyframe", "need `clip`"))?;
+    let target = if p.get("track").is_some() {
+        crate::video_track_fx::target(s, p, true)?
+    } else {
+        crate::EffectTarget::Clip(clip_p(p, "clip").ok_or_else(|| bad("keyframe", "need clip or track"))?)
+    };
     let pid = str_p(p, "param").ok_or_else(|| bad("keyframe", "need `param`"))?.to_string();
     let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
     let at = time_p(s, p, "");
@@ -4119,20 +4194,46 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
         _ => "Keyframe Interpolation",
     };
     // a keyframe dragged on the timeline is one undo step, like a dragged value
-    let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("keyframe:{op}:{}:{eff}:{pid}:{}", c.0, p.get("mask").unwrap_or(&Value::Null)));
+    let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("keyframe:{op}:{target:?}:{eff}:{pid}:{}", p.get("mask").unwrap_or(&Value::Null)));
     if bool_p(p, "begin").unwrap_or(false) {
         s.history.merge_key = None;
     }
     s.edit_sequence_as(label, merge.as_deref(), |q, _, _| {
         let mut reply = Value::Null;
-        let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
-        let mt_now = it.effect_time_at(at.unwrap_or_else(|| playhead.clamp(it.start, (it.end() - Tick(1)).max(it.start))));
+        let time = match (at, target) {
+            (Some(time), _) => time,
+            (None, crate::EffectTarget::Clip(id)) => {
+                let (_, it) = q.find_item(id).ok_or(filmcraft_edit::EditError::NoItem(id))?;
+                playhead.clamp(it.start, (it.end() - Tick(1)).max(it.start))
+            }
+            (None, crate::EffectTarget::VideoTrack(_)) => playhead,
+        };
+        let mt_now = crate::effect_target::effect_time(q, target, time)?;
+        let stack = crate::effect_target::effects_mut(q, target)?;
         let e = match &eff {
-            Value::Number(n) => it.effects.get_mut(n.as_u64().unwrap_or(0) as usize),
-            Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+            Value::Number(n) => n.as_u64().and_then(|i| usize::try_from(i).ok()).and_then(|i| stack.get_mut(i)),
+            Value::String(sid) => stack.iter_mut().find(|e| &e.effect == sid),
             _ => None,
         }
         .ok_or_else(|| bad("keyframe", "no such effect"))?;
+        let definition = e.def().and_then(|d| d.param(&pid));
+        if (matches!(target, crate::EffectTarget::VideoTrack(_)) || e.effect == "dynamic_zoom") && !definition.is_some_and(|d| d.animatable) {
+            return Err(bad("keyframe", "parameter cannot be animated"));
+        }
+        let new_value = if let Some(v) = p.get("value") {
+            if matches!(target, crate::EffectTarget::VideoTrack(_)) {
+                Some(crate::video_track_fx::value_for(definition.ok_or_else(|| bad("keyframe", "unknown parameter"))?, v)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        for at in [mtime, to].into_iter().flatten() {
+            if at.0.unsigned_abs() > filmcraft_project::ProjectView::MAX_PLAYHEAD.0 as u64 {
+                return Err(bad("keyframe", "time outside supported bounds"));
+            }
+        }
         let prm = crate::masks::target_param(e, p, &pid).ok_or_else(|| bad("keyframe", "no such param"))?;
         match op {
             "add" => {
@@ -4154,7 +4255,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                     let mut k = prm.keyframes.remove(i);
                     k.time = to;
                     if let Some(v) = p.get("value") {
-                        k.value = json_to_param(&k.value, v).ok_or_else(|| bad("keyframe", "value has the wrong type"))?;
+                        k.value = new_value.clone().or_else(|| json_to_param(&k.value, v)).ok_or_else(|| bad("keyframe", "value has the wrong type"))?;
                     }
                     prm.keyframes.retain(|x| x.time != to);
                     let at = prm.keyframes.partition_point(|x| x.time < to);
@@ -4165,7 +4266,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
                 let at = mtime.ok_or_else(|| bad("keyframe", "need `mediaTime`"))?;
                 let k = prm.keyframes.iter_mut().find(|k| k.time == at).ok_or_else(|| bad("keyframe", "no keyframe at that time"))?;
                 if let Some(v) = p.get("value") {
-                    k.value = json_to_param(&k.value, v).ok_or_else(|| bad("keyframe", "value has the wrong type"))?;
+                    k.value = new_value.clone().or_else(|| json_to_param(&k.value, v)).ok_or_else(|| bad("keyframe", "value has the wrong type"))?;
                 }
                 if let Some(x) = f64_p(p, "inInfluence") {
                     k.in_influence = x.clamp(0.01, 1.0);
@@ -4484,6 +4585,7 @@ fn nest(s: &mut Session, p: &Value) -> Result<Value> {
     if items.is_empty() {
         return Err(EngineError::Other("nothing selected".into()));
     }
+    crate::sequence_tools::validate_video_fx_extraction(&q, &items)?;
     let start = items.iter().map(|i| i.2.start).min().unwrap_or_default();
     let end = items.iter().map(|i| i.2.end()).max().unwrap_or_default();
     let span = TimeRange::new(start, end - start);
@@ -4523,6 +4625,7 @@ fn nest(s: &mut Session, p: &Value) -> Result<Value> {
             // tracks take the name and channel layout of the track their clips came from
             for (tr, src) in nq.video_tracks.iter_mut().zip(&q.video_tracks) {
                 tr.name = src.name.clone();
+                tr.video_effects_bypassed = src.video_effects_bypassed;
             }
             for (from, to) in &audio_at {
                 if let (Some(tr), Some(src)) = (nq.audio_tracks.get_mut(*to), q.audio_tracks.get(*from)) {
@@ -4711,6 +4814,9 @@ fn transition_ids_p(v: &Value) -> Option<Vec<TransitionId>> {
 /// `effects.select`: the effect selected in Effect Controls (`effect`: index, or the id of the
 /// clip's first effect of that kind). It replaces the mask selection.
 fn select_effect(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("track").is_some() {
+        return crate::video_track_fx::select_effect(s, p);
+    }
     const CMD: &str = "effects.select";
     if bool_p(p, "none") == Some(true) {
         s.state.selected_effect = None;
@@ -4727,6 +4833,14 @@ fn select_effect(s: &mut Session, p: &Value) -> Result<Value> {
     .ok_or_else(|| bad(CMD, "no such effect on clip"))?;
     s.state.selected_effect = crate::EffectSel::of(clip, &it.effects, effect);
     s.state.selected_mask = None;
+    s.state.effect_controls_target = None;
+    if !s.state.selection.contains(&clip) {
+        s.state.selection = vec![clip];
+        s.state.transition_selection.clear();
+        s.state.caption_selection.clear();
+        s.state.gap_selection = None;
+        s.state.edit_points.clear();
+    }
     Ok(Value::Null)
 }
 
@@ -5090,6 +5204,7 @@ pub fn inspect_sequence(s: &Session, id: ItemId, q: &filmcraft_project::Sequence
     let tr = |t: &filmcraft_project::Track| {
         json!({
             "id": t.id.0, "name": t.name, "locked": t.locked, "syncLock": t.sync_lock, "enabled": t.enabled, "muted": t.muted, "solo": t.solo,
+            "effects": t.effects, "videoEffectsBypassed": t.video_effects_bypassed,
             "label": t.label.map(|l| l.name()),
             "items": t.items.iter().map(|i| json!({
                 "clip": i.id.0, "item": i.item.0, "name": i.name, "start": i.start.0, "duration": i.duration.0,

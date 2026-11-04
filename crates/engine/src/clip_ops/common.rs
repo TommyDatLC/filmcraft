@@ -125,17 +125,35 @@ pub(crate) fn collapse_history(s: &mut Session, n0: usize, label: &str) {
 /// sequences count as used).
 pub(super) fn used_items(p: &Project) -> BTreeSet<ItemId> {
     let mut used = BTreeSet::new();
+    let mut alpha_paths = BTreeSet::new();
     for it in p.items.values() {
         if let ItemKind::Sequence(q) = &it.kind {
             for t in q.all_tracks() {
                 for i in &t.items {
                     used.insert(i.item);
+                    for effect in &i.effects {
+                        if effect.effect == "delta_key"
+                            && let Some(param) = effect.params.get("alpha_source")
+                            && let filmcraft_project::ParamValue::Text(path) = &param.value
+                            && !path.is_empty()
+                        {
+                            alpha_paths.insert(path.replace('\\', "/").to_ascii_lowercase());
+                        }
+                    }
                 }
             }
             if let Some(m) = &q.merged {
                 let v = serde_json::to_value(m).unwrap_or_default();
                 collect_ids(&v, &mut used, p);
             }
+        }
+    }
+    for item in p.items.values() {
+        if let ItemKind::Media(media) = &item.kind
+            && let filmcraft_project::MediaRef::File { path } = &media.media
+            && alpha_paths.contains(&path.replace('\\', "/").to_ascii_lowercase())
+        {
+            used.insert(item.id);
         }
     }
     // subclip parents of anything kept

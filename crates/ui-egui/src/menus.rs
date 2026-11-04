@@ -927,6 +927,7 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
     for it in &mut v {
         it.label = app.ui.language.tr(&it.label).to_string();
         match it.id.as_str() {
+            "dev.logging.toggle" => it.checked = Some(app.session.dev_log.enabled()),
             "app.language.english" => it.checked = Some(app.ui.language == crate::i18n::Language::En),
             "app.language.japanese" => it.checked = Some(app.ui.language == crate::i18n::Language::Ja),
             "app.language.spanish" => it.checked = Some(app.ui.language == crate::i18n::Language::Es),

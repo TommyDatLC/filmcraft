@@ -172,6 +172,11 @@ fn handle_ui_set(app: &mut FilmcraftApp, ctx: &egui::Context, p: &Value) -> Outc
     if let Some(q) = s("effectsSearch") {
         app.ui.effects_search = q.to_string();
     }
+    if let Some(q) = s("effectSearchQuery") {
+        app.ui.effect_search.query = q.chars().take(256).collect();
+        app.ui.effect_search.selected = 0;
+        app.ui.effect_search.message.clear();
+    }
     // Effect Controls keyframe selection (`[{clip, effect, param, mask?, time}]`), replaced;
     // references to missing keyframes are dropped by the panel
     if let Some(v) = p.get("keyframeSelection") {
@@ -496,7 +501,11 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
             let params = p.get("params").cloned().unwrap_or(json!({}));
             let invoke = if req.method == "engine.execute" { crate::menus::invoke_command } else { crate::menus::invoke };
-            match invoke(app, ctx, id, params) {
+            let previous_origin = app.session.dev_log.control_origin;
+            app.session.dev_log.control_origin = true;
+            let result = invoke(app, ctx, id, params);
+            app.session.dev_log.control_origin = previous_origin;
+            match result {
                 Ok(v) => ok(v),
                 Err(e) => err(e),
             }

@@ -55,7 +55,12 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 continue;
             }
-            let mut items: Vec<_> = defs.iter().filter(|d| d.category.first() == Some(&top)).filter(|d| crate::i18n::matches_query(d.name, filter)).collect();
+            let mut items: Vec<_> = defs
+                .iter()
+                .filter(|d| d.category.first() == Some(&top))
+                .filter(|d| super::effects_search::track_target(app).is_none() || filmcraft_project::video_fx::supports_track(d))
+                .filter(|d| crate::i18n::matches_query(d.name, filter))
+                .collect();
             // Premiere lists effect folders and effects alphabetically (obsolete ones last)
             if top == "Video Effects" || top == "Legacy" {
                 items.sort_by_key(|d| (d.category.get(1) == Some(&"Obsolete"), d.category.get(1).copied().unwrap_or(""), d.name.to_ascii_lowercase()));
@@ -142,9 +147,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.ui.status = e.to_string();
     }
     if let Some(id) = apply {
-        let r = app.session.execute("effects.apply", json!({"effect": id}));
-        if let Err(e) = r {
-            app.ui.status = e.to_string();
+        let params = super::effects_search::track_target(app).map_or_else(|| json!({"effect": id}), |track| json!({"effect": id, "track": track.0}));
+        if let Err(error) = app.session.execute("effects.apply", params) {
+            app.ui.status = error.to_string();
         }
     }
 }

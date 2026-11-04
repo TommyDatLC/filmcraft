@@ -182,6 +182,8 @@ pub struct Preferences {
     pub project_panel: crate::project_panel::ProjectPanelPrefs,
     /// Media Browser: Favorites, recent directories, file types, view, columns.
     pub media_browser: crate::media_browser::MediaBrowserPrefs,
+    /// Successfully applied effects, newest first; stored independently of project undo history.
+    pub recent_effects: Vec<String>,
 }
 
 impl Default for Preferences {
@@ -209,6 +211,7 @@ impl Default for Preferences {
             voice_over: Default::default(),
             project_panel: Default::default(),
             media_browser: Default::default(),
+            recent_effects: Vec::new(),
         }
     }
 }
@@ -413,6 +416,23 @@ impl Preferences {
     pub fn from_value(mut v: Value) -> Self {
         settings::migrate(&mut v);
         settings::sanitize(&mut v, &Self::default().to_value());
+        // Repair history independently: a damaged optional field must not discard the user's
+        // language, playback, autosave, or other settings when serde reads the document.
+        if let Some(history) = v.get_mut("recentEffects") {
+            let mut ids = Vec::new();
+            if let Some(items) = history.as_array() {
+                for item in items.iter().take(256) {
+                    let Some(id) = item.as_str() else { continue };
+                    if filmcraft_project::effect::find_effect(id).is_some() && !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                    if ids.len() == 10 {
+                        break;
+                    }
+                }
+            }
+            *history = serde_json::json!(ids);
+        }
         let mut p: Preferences = serde_json::from_value(v).unwrap_or_default();
         p.clamp();
         p

@@ -3725,3 +3725,5 @@
 	Options:	Options :
 	Invalid duration: {error}	Durée non valide : {error}
 # Control server: the bind-failure notice (port collisions; #3318 may show it too).
+
+# Custom video effects and preview controls

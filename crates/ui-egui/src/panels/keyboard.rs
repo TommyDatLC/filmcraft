@@ -12,7 +12,8 @@
 //! | `window.openSearch` / `panel.selectFindBox` | Open Search / Select Find Box | Cmd+Shift+F / Shift+F |
 //! | `view.programZoom100` / `view.programZoomFit` | Zoom Program Monitor to 100% / Fit | Cmd+Shift+1 / Cmd+Shift+0 |
 //! | `view.sourceZoom100` / `view.sourceZoomFit` | Zoom Source Monitor to 100% / Fit | Cmd+Alt+Shift+1 / Cmd+Alt+Shift+0 |
-//! | `playback.inToOutPreroll` / `playback.toOut` | Play In to Out with Preroll/Postroll / Play from Playhead to Out Point | Shift+Space / Ctrl+Space |
+//! | `effects.openSearch` | Search effects, recent-first, then apply to selected clips | Shift+Space |
+//! | `playback.inToOutPreroll` / `playback.toOut` | Play In to Out with Preroll/Postroll / Play from Playhead to Out Point | unassigned / Ctrl+Space |
 //! | `timeline.expandAllTracks` / `timeline.minimizeAllTracks` | Expand / Minimize All Tracks | Shift+= / Shift+- |
 //! | `timeline.increaseVideoHeight` … `timeline.decreaseAudioHeight` | Increase / Decrease Video / Audio Tracks Height | Cmd+= / Cmd+- / Alt+= / Alt+- (Timeline) |
 //! | `timeline.nextScreen` / `timeline.prevScreen` | Show Next / Previous Screen | PageDown / PageUp (Timeline) |
@@ -65,6 +66,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("window.prevPanel", "Select Previous Panel", [], Some("Ctrl+Shift+,")),
     uic!("window.toggleMonitorFocus", "Toggle Source/Program Monitor Focus", [], None),
     uic!("window.openSearch", "Open Search", [], Some("Cmd+Shift+F")),
+    uic!("effects.openSearch", "Search effects", ["Window"], Some("Shift+Space")),
     uic!("panel.selectFindBox", "Select Find Box", [], Some("Shift+F")),
     uic!("window.workspace.learning", "Learning", ["Window", "Workspaces"], Some("Alt+Shift+7")),
     uic!("window.workspace.review", "Review", ["Window", "Workspaces"], Some("Alt+Shift+8")),
@@ -72,7 +74,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("view.programZoomFit", "Zoom Program Monitor to Fit", [], Some("Cmd+Shift+0")),
     uic!("view.sourceZoom100", "Zoom Source Monitor to 100%", [], Some("Cmd+Alt+Shift+1")),
     uic!("view.sourceZoomFit", "Zoom Source Monitor to Fit", [], Some("Cmd+Alt+Shift+0")),
-    uic!("playback.inToOutPreroll", "Play In to Out with Preroll/Postroll", [], Some("Shift+Space")),
+    uic!("playback.inToOutPreroll", "Play In to Out with Preroll/Postroll", [], None),
     uic!("playback.toOut", "Play from Playhead to Out Point", [], Some("Ctrl+Space")),
     uic!("timeline.expandAllTracks", "Expand All Tracks", [], Some("Shift+=")),
     uic!("timeline.minimizeAllTracks", "Minimize All Tracks", [], Some("Shift+-")),
@@ -169,6 +171,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             app.show_panel(PanelKind::Project);
             Ok(focus_find_box(app, ctx))
         }
+        "effects.openSearch" => crate::panels::effects_search::open(app).map(|()| json!({"dialog": "EffectSearch"})),
         "panel.selectFindBox" => Ok(focus_find_box(app, ctx)),
         "window.workspace.learning" | "window.workspace.review" => {
             let name = if id.ends_with("learning") { "Learning" } else { "Review" };

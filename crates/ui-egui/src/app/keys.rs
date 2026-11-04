@@ -15,7 +15,10 @@ impl FilmcraftApp {
         // A focused dock divider or floating-window grip takes the arrow keys to nudge it, but no
         // other key: Space and the other shortcuts keep working (#1482).
         let divider_focused = self.divider_focused(ctx);
-        if (ctx.egui_wants_keyboard_input() && !divider_focused) || self.dialog == Some(Dialog::Shortcuts) || self.ui.clip_dialog.is_some() {
+        if (ctx.egui_wants_keyboard_input() && !divider_focused)
+            || matches!(self.dialog, Some(Dialog::Shortcuts | Dialog::EffectSearch))
+            || self.ui.clip_dialog.is_some()
+        {
             return;
         }
         // A focused text field takes every unmodified key, including the ones our shortest
@@ -40,7 +43,7 @@ impl FilmcraftApp {
     /// arrive, so shortcuts work while a floating window has focus. craft-ui forwards nothing
     /// while that window's text field has focus.
     pub(crate) fn handle_forwarded_keys(&mut self, ctx: &egui::Context, events: Vec<egui::Event>) {
-        if events.is_empty() || self.dialog == Some(Dialog::Shortcuts) {
+        if events.is_empty() || matches!(self.dialog, Some(Dialog::Shortcuts | Dialog::EffectSearch)) {
             return;
         }
         let mut input = egui::InputState::default();
@@ -197,9 +200,9 @@ fn clipboard_events_as_keys(events: &mut Vec<egui::Event>, modifiers: egui::Modi
 
 /// Whether holding a shortcut's key repeats the command. Transport commands start, stop or
 /// toggle playback, so the OS key repeats of a held Space would flip Play/Stop many times a
-/// second; they run once per press. Stepping, nudging and the rest keep repeating.
+/// second. Effect search also opens once per press. Stepping and nudging keep repeating.
 fn repeats_when_held(id: &str) -> bool {
-    !(id.starts_with("playback.") || id.starts_with("source.playback."))
+    !(id.starts_with("playback.") || id.starts_with("source.playback.") || id == "effects.openSearch")
 }
 
 /// Like `InputState::consume_key`, but only a fresh press fires. Key repeats of the chord are
@@ -373,6 +376,7 @@ mod key_repeat_tests {
     /// A repeat of Shift+Space is swallowed, not handed down to the plain Space binding.
     #[test]
     fn held_shift_space_does_not_fall_through_to_play_stop() {
+        assert_eq!(fired(vec![space(false, Modifiers::SHIFT), space(true, Modifiers::SHIFT)]), ["effects.openSearch"]);
         assert!(fired(vec![space(true, Modifiers::SHIFT)]).is_empty());
     }
 

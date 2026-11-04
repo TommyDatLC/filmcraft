@@ -276,11 +276,31 @@ pub(crate) fn layered_at(project: &Project, seq: &Sequence, t: Tick) -> bool {
         if !tr.enabled {
             continue;
         }
+        let active = tr.item_at(t).is_some_and(|i| i.enabled) || tr.transitions.iter().any(|x| x.range().contains(t));
+        if !tr.video_effects_bypassed
+            && tr.items.iter().any(|item| {
+                item.enabled
+                    && (item.range().contains(t) || tr.transitions.iter().any(|x| x.range().contains(t) && (x.from == Some(item.id) || x.to == Some(item.id))))
+                    && item.effects.iter().any(|e| e.effect == "dynamic_zoom" && e.enabled)
+            })
+        {
+            return false;
+        }
+
+        if active && (tr.video_effects_bypassed || crate::video_track_fx::has_stack(tr, RenderOptions::default())) {
+            return false;
+        }
         if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t)) {
-            if !simple_transition(&trn.effect.effect) && trn.effect.effect != "push" {
-                return false;
-            }
-            if [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(adjustment) {
+            let non_normal = [trn.from, trn.to]
+                .into_iter()
+                .flatten()
+                .filter_map(|id| tr.item(id))
+                .filter(|i| i.enabled)
+                .any(|item| crate::opacity_blend(item, item.effect_time_at(t)).1 != Blend::Normal);
+            if non_normal
+                || (!simple_transition(&trn.effect.effect) && trn.effect.effect != "push")
+                || [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(adjustment)
+            {
                 return false;
             }
         }
@@ -389,7 +409,8 @@ struct Scene<'a> {
 }
 
 /// Push the layer(s) of `item`. `blend` overrides the item's own blend mode: inside a transition
-/// the CPU reference mixes the clips and composites the result Normal, ignoring their modes.
+/// only the Normal-mode fast path overrides a transition input's blend here;
+/// non-Normal and mixed-mode transitions use the CPU reference compositor.
 /// `nest` counts the multi-camera clips already followed to reach `item` (see
 /// [`crate::MAX_NEST_DEPTH`]).
 fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blend>, out: &mut PlanStack) {
