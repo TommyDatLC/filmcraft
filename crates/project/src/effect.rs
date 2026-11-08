@@ -16,6 +16,8 @@ mod audio;
 use crate::mask::Mask;
 pub use audio::{GEQ10_LABELS, GEQ20_LABELS, GEQ30_LABELS, PREMIERE_AUDIO_EFFECTS};
 
+mod dynamic_zoom;
+mod resolve_custom;
 mod vfx;
 pub use vfx::{EASINGS, ECHO_OPERATORS, FRAME_LAYOUTS, LIGHT_IDS, SIMPLE_BLEND, TRACK_CHOICES, auto_point, ultra_key_setting};
 
@@ -870,6 +872,8 @@ fn build_effects() -> Vec<EffectDef> {
     ];
     v.extend(audio::defs());
     v.extend(vfx::defs());
+    v.extend(resolve_custom::defs());
+    v.push(dynamic_zoom::definition());
     vfx::extend_core(&mut v);
     v.extend(crate::vtransition::video_transition_defs());
     v.extend(crate::graphic::layer_defs());
@@ -880,6 +884,12 @@ fn build_effects() -> Vec<EffectDef> {
         }
     }
     vfx::apply_badges(&mut v);
+    for e in &mut v {
+        if e.category.first() == Some(&"Custom Effects") {
+            e.accelerated = false;
+            e.float32 = true;
+        }
+    }
     v
 }
 

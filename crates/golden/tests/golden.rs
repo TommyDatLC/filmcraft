@@ -867,13 +867,9 @@ fn gpu_blend_modes_match_cpu_render() {
     assert!(failures.is_empty(), "GPU blend modes differ from the CPU render:\n{}", failures.join("\n"));
 }
 
-/// Inside a transition the CPU mixes the clips and composites the result Normal, ignoring their
-/// blend modes: the plan does the same (Screen clips cross-dissolving on V2 over V1).
+/// Screen clips cross-dissolving on V2 must keep their blend over V1, including in the GPU preview.
 #[test]
-fn gpu_transition_of_blended_clips_matches_cpu_render() {
-    let Some((dev, q)) = device("gpu blend parity", false) else {
-        return;
-    };
+fn transition_of_blended_clips_preserves_screen_in_gpu_preview() {
     let mut b = Builder::new(2);
     let (bg, x, y) = (b.demo(DemoScene::OceanSunset), b.demo(DemoScene::Aurora), b.demo(DemoScene::Dunes));
     b.place(0, bg, 0, 48);
@@ -892,8 +888,16 @@ fn gpu_transition_of_blended_clips_matches_cpu_render() {
         filmcraft_render::plan::DeviceCaps::ALL,
         &s.sources,
     );
-    let filmcraft_render::plan::FramePlan::Layers { layers, .. } = &plan else { panic!("planned as a CPU image") };
-    assert!(layers.iter().all(|l| l.blend == filmcraft_render::Blend::Normal));
+    let filmcraft_render::plan::FramePlan::Image(image) = &plan else { panic!("blended transition must use the CPU fallback") };
+    let mut normal = s.project.clone();
+    for item in &mut normal.sequence_mut(s.seq).unwrap().video_tracks[1].items {
+        item.effect_mut("opacity").unwrap().params.get_mut("blend").unwrap().value = blend("Normal");
+    }
+    let normal_image = render_sequence(&normal, s.seq, RATE.tick_of(s.frame), RenderOptions::default(), &s.sources);
+    assert!(image.px.iter().zip(&normal_image.px).any(|(a, b)| (a - b).abs() > 1e-4), "Screen must not be replaced with Normal");
+    let Some((dev, q)) = device("gpu blend parity", false) else {
+        return;
+    };
     let mut c = filmcraft_gpu::GpuCompositor::new(&dev, &q);
     c.composite(&plan);
     let (gw, gh, mut px) = c.read_output().expect("GPU readback");

@@ -199,6 +199,7 @@ pub fn export(s: &mut Session, p: &Value) -> Result<Value> {
 mod embedded_audio_tests {
     use std::collections::HashMap;
     use std::io;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     use crate::{Services, Session};
@@ -231,15 +232,19 @@ mod embedded_audio_tests {
     #[test]
     fn virtual_extraction_keeps_existing_media() {
         let files = Arc::new(VirtualFiles::default());
-        files.0.lock().unwrap().insert("/files/cut Audio.wav".into(), b"first".to_vec());
-        files.0.lock().unwrap().insert("/files/cut Audio (2).wav".into(), b"second".to_vec());
+        // The fake host keys paths literally; use native separators, as the importer does.
+        let original = Path::new("/files").join("cut Audio.wav").to_string_lossy().into_owned();
+        let occupied = Path::new("/files").join("cut Audio (2).wav").to_string_lossy().into_owned();
+        let extracted = Path::new("/files").join("cut Audio (3).wav").to_string_lossy().into_owned();
+        files.0.lock().unwrap().insert(original.clone(), b"first".to_vec());
+        files.0.lock().unwrap().insert(occupied.clone(), b"second".to_vec());
         let session = Session::new(files.clone());
-        let path = write_embedded_audio(&session, "/files/cut Audio.wav", b"new audio").unwrap();
-        assert_eq!(path, "/files/cut Audio (3).wav");
+        let path = write_embedded_audio(&session, &original, b"new audio").unwrap();
+        assert_eq!(path, extracted);
         let stored = files.0.lock().unwrap();
-        assert_eq!(stored["/files/cut Audio.wav"], b"first");
-        assert_eq!(stored["/files/cut Audio (2).wav"], b"second");
-        assert_eq!(stored["/files/cut Audio (3).wav"], b"new audio");
+        assert_eq!(stored[&original], b"first");
+        assert_eq!(stored[&occupied], b"second");
+        assert_eq!(stored[&extracted], b"new audio");
     }
 
     #[test]

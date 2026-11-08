@@ -1347,6 +1347,44 @@ fn applied_transform_centres_its_points_in_the_clip_picture() {
     }
 }
 
+fn custom_zoom_pivot_fixture() -> (Session, u64, filmcraft_geom::Vec2) {
+    let mut s = demo();
+    let result = s.execute("file.newColorMatte", json!({"width":180,"height":320,"color":"#ff0000"})).unwrap();
+    let result = s.execute("timeline.place", json!({"item":result["item"],"track":"V3","seconds":0.0})).unwrap();
+    let c = result["clips"][0].as_u64().unwrap();
+    s.execute("effects.apply", json!({"clips":[c],"effect":"exponential_zoom"})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let center = filmcraft_geom::Vec2::new(f64::from(q.settings.width) / 2.0, f64::from(q.settings.height) / 2.0);
+    (s, c, center)
+}
+
+fn custom_zoom_pivot(s: &Session, c: u64) -> filmcraft_geom::Vec2 {
+    clip(s, c).effect("exponential_zoom").unwrap().param("pivot").unwrap().value.as_vec2().unwrap()
+}
+
+#[test]
+fn custom_zoom_pivot_apply_uses_sequence_center_for_portrait_footage() {
+    let (s, c, center) = custom_zoom_pivot_fixture();
+    assert_eq!(custom_zoom_pivot(&s, c), center);
+}
+
+#[test]
+fn custom_zoom_pivot_reset_effect_uses_sequence_center() {
+    let (mut s, c, center) = custom_zoom_pivot_fixture();
+    s.execute("effects.setParam", json!({"clip":c,"effect":"exponential_zoom","param":"pivot","value":[10.0,20.0]})).unwrap();
+    let index = clip(&s, c).effects.iter().position(|e| e.effect == "exponential_zoom").unwrap();
+    s.execute("effects.reset", json!({"clip":c,"index":index})).unwrap();
+    assert_eq!(custom_zoom_pivot(&s, c), center);
+}
+
+#[test]
+fn custom_zoom_pivot_reset_parameter_uses_sequence_center() {
+    let (mut s, c, center) = custom_zoom_pivot_fixture();
+    s.execute("effects.setParam", json!({"clip":c,"effect":"exponential_zoom","param":"pivot","value":[10.0,20.0]})).unwrap();
+    s.execute("effects.resetParam", json!({"clip":c,"effect":"exponential_zoom","param":"pivot"})).unwrap();
+    assert_eq!(custom_zoom_pivot(&s, c), center);
+}
+
 #[test]
 fn set_param_rejects_colour_component_that_overflows_f32() {
     // 1e300 is a finite JSON number but saturates to an infinite f32, which saved as `null` and could not be reopened

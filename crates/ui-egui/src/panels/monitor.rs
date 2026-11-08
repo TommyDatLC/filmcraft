@@ -39,12 +39,13 @@ struct PictureCtx {
     pic: Rect,
     video_area: Rect,
     prefix: &'static str,
+    effect_preview: Option<(u64, std::sync::Arc<filmcraft_project::Project>)>,
 }
 
 /// The picture block: schedules this frame's render request (GPU or CPU), shows the texture
 /// that is ready, and draws the safe margins, comparison reference and display-mode label.
 fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &crate::state::MonitorView, pc: PictureCtx) {
-    let PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix } = pc;
+    let PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix, effect_preview } = pc;
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let display = mv.display_mode().unwrap_or(DisplayMode::Composite);
@@ -65,11 +66,12 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
         Target::Item(i) => app.item_revision(i),
         _ => app.session.revision,
     };
+    let rev = effect_preview.as_ref().map_or(rev, |p| p.0);
     let size_key = (scale * 1000.0) as u32;
     let channel = display.is_channel();
     // the GPU compositor's output is opaque, so the Transparency Grid takes the CPU frames
     let grid = mv.transparency_grid && !channel;
-    let use_gpu = which == Which::Program && app.gpu.is_some() && !channel && !grid && !crate::panels::menu_dialogs::software_renderer(app);
+    let use_gpu = picture_gpu_allowed(app, which, target, channel, grid);
     // render previews are opaque, so the grid and Display Mode ▸ Alpha take live renders
     let live = grid || display == DisplayMode::Alpha;
     let cpu_target = target;
@@ -81,7 +83,7 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     // Draft decoding (opt-in): only while playing at 1/2 resolution or lower.
     let draft = crate::frames::draft_playback(playing, scale, app.session.prefs.playback.draft_decode);
     let key = FrameKey { target, frame, size: size_key, revision: rev, draft };
-    let project = app.session.project.clone();
+    let project = effect_preview.as_ref().map_or_else(|| app.session.project.clone(), |p| p.1.clone());
     let speed = if which == Which::Program { app.playback.speed } else { app.source_playback.clock.speed };
     // while playing, which way: frames on the other side of the playhead are not due yet
     let dir = playing.then(|| play_direction(speed));
@@ -359,10 +361,17 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     } else {
         video_area
     };
+    let CustomPreview { target, dynamic: dynamic_preview, effect: effect_preview } = custom_preview(app, &ctx, which, pic, frame_size, target);
     let saved_clip = ui.clip_rect();
     ui.set_clip_rect(saved_clip.intersect(if mv.zoom.is_some() && !compare && !cinema { video_area } else { picture_area.expand(12.0) }));
     if show_picture {
-        draw_picture(app, ui, which, &mv, PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix });
+        draw_picture(
+            app,
+            ui,
+            which,
+            &mv,
+            PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix, effect_preview },
+        );
     }
     drop_indicator(app, ui, video_area, which, &t);
     if cinema {
@@ -371,7 +380,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     }
     // A click on the Program monitor around the picture lets go of what is selected on it (#683;
     // in the picture the overlays do that). Under the picture and the overlays, so they come first.
-    if which == Which::Program && show_picture && ui.interact(video_area, egui::Id::unique((prefix, "background")), Sense::click()).clicked() {
+    if which == Which::Program
+        && show_picture
+        && !dynamic_preview
+        && ui.interact(video_area, egui::Id::unique((prefix, "background")), Sense::click()).clicked()
+    {
         crate::panels::graphics::deselect_on_monitor(app, ui);
     }
     // Click/drag in the picture: the Hand tool pans a magnified picture, otherwise focus.
@@ -382,16 +395,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         monitor_view::zoom_pan_input(app, ui, which, video_area, pic, display_w, ppp);
     }
     if which == Which::Program && show_picture {
-        // an armed eyedropper owns clicks on the picture: the overlays would sit on top and take
-        // them (the selected clip's transform handles cover it, #1023)
-        if app.ui.eyedropper.is_some() {
-            eyedropper(app, ui, &pic_resp, pic, target, rate, time);
-        } else {
-            crate::panels::graphics::monitor_overlay(app, ui, pic, frame_size);
-            crate::panels::masks::monitor_overlay(app, ui, pic, frame_size);
-            crate::panels::motion_path::monitor_overlay(app, ui, pic, frame_size);
-            crate::panels::transform_handles::monitor_overlay(app, ui, pic, frame_size);
-        }
+        edit_overlays(app, ui, &pic_resp, pic, frame_size, EditOverlayCtx { target, rate, time, dynamic_preview });
     }
     if show_picture {
         monitor_view::guides(app, ui, which, video_area, pic, frame_size);
@@ -1313,6 +1317,37 @@ fn source_nav(app: &mut FilmcraftApp, cmd: &str) {
     let _ = app.session.execute("source.setPlayhead", json!({"time": t.0}));
 }
 
+fn picture_gpu_allowed(app: &FilmcraftApp, which: Which, target: Target, channel: bool, grid: bool) -> bool {
+    let custom_preview = matches!(target, Target::DynamicZoomEdit { .. } | Target::EffectPreview(_));
+    which == Which::Program && !custom_preview && app.gpu.is_some() && !channel && !grid && !crate::panels::menu_dialogs::software_renderer(app)
+}
+
+struct EditOverlayCtx {
+    target: Target,
+    rate: filmcraft_time::FrameRate,
+    time: Tick,
+    dynamic_preview: bool,
+}
+
+fn edit_overlays(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic_resp: &egui::Response, pic: Rect, frame_size: (u32, u32), context: EditOverlayCtx) {
+    let EditOverlayCtx { target, rate, time, dynamic_preview } = context;
+    // An armed eyedropper owns picture clicks before every edit overlay.
+    if app.ui.eyedropper.is_some() {
+        eyedropper(app, ui, pic_resp, pic, target, rate, time);
+    } else if dynamic_preview {
+        super::dynamic_zoom_handles::monitor_overlay(app, ui, pic, frame_size);
+    } else {
+        let vignette = super::vignette_handles::active(app, pic, frame_size);
+        super::vignette_handles::monitor_overlay(app, ui, pic, frame_size);
+        if !vignette {
+            crate::panels::graphics::monitor_overlay(app, ui, pic, frame_size);
+            crate::panels::masks::monitor_overlay(app, ui, pic, frame_size);
+            crate::panels::motion_path::monitor_overlay(app, ui, pic, frame_size);
+            crate::panels::transform_handles::monitor_overlay(app, ui, pic, frame_size);
+        }
+    }
+}
+
 fn paint_ruler_markers(
     app: &FilmcraftApp,
     p: &egui::Painter,
@@ -1344,6 +1379,26 @@ fn paint_ruler_markers(
     }
 }
 
+struct CustomPreview {
+    target: Target,
+    dynamic: bool,
+    effect: Option<(u64, std::sync::Arc<filmcraft_project::Project>)>,
+}
+
+fn custom_preview(app: &mut FilmcraftApp, ctx: &egui::Context, which: Which, pic: Rect, frame: (u32, u32), target: Target) -> CustomPreview {
+    if which != Which::Program || app.ui.fullscreen_program {
+        return CustomPreview { target, dynamic: false, effect: None };
+    }
+    let dynamic = super::dynamic_zoom_handles::preview_target(app);
+    let effect = super::vignette_handles::preview_project(app, ctx, pic, frame);
+    let target = if effect.is_some() {
+        app.session.state.active_sequence.map_or(target, Target::EffectPreview)
+    } else {
+        dynamic.map_or(target, |(sequence, clip)| Target::DynamicZoomEdit { sequence, clip })
+    };
+    CustomPreview { target, dynamic: dynamic.is_some(), effect }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,6 +1406,44 @@ mod tests {
 
     fn flat(w: usize, h: usize, rgba: [u8; 4]) -> Rgba {
         Rgba { w, h, px: rgba.iter().copied().cycle().take(w * h * 4).collect() }
+    }
+
+    #[test]
+    fn cinema_shows_the_sequence_while_dynamic_zoom_is_being_edited() {
+        let mut session = filmcraft_engine::Session::default();
+        session.execute("file.openDemoProject", serde_json::json!({})).unwrap();
+        let sequence = session.state.active_sequence.unwrap();
+        let clip = session.active_sequence().unwrap().video_tracks.iter().flat_map(|track| &track.items).next().unwrap();
+        let (clip, start) = (clip.id, clip.start);
+        session.execute("playhead.set", serde_json::json!({"time":start.0})).unwrap();
+        session.execute("timeline.select", serde_json::json!({"clips":[clip.0]})).unwrap();
+        session.execute("effects.apply", serde_json::json!({"clips":[clip.0],"effect":"dynamic_zoom"})).unwrap();
+        session.execute("effects.select", serde_json::json!({"clip":clip.0,"effect":"dynamic_zoom"})).unwrap();
+        let mut app = FilmcraftApp::new(session);
+        app.ui.dynamic_zoom_edit = Some(clip);
+        let ctx = egui::Context::default();
+        let target = Target::Sequence(sequence);
+        let pic = Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 180.0));
+        assert_eq!(custom_preview(&mut app, &ctx, Which::Program, pic, (320, 180), target).target, Target::DynamicZoomEdit { sequence, clip });
+        app.ui.fullscreen_program = true;
+        assert_eq!(custom_preview(&mut app, &ctx, Which::Program, pic, (320, 180), target).target, target);
+        app.ui.fullscreen_program = false;
+        assert_eq!(custom_preview(&mut app, &ctx, Which::Program, pic, (320, 180), target).target, Target::DynamicZoomEdit { sequence, clip });
+    }
+
+    #[test]
+    fn cinema_shows_the_sequence_without_an_invisible_effect_search() {
+        let mut app = FilmcraftApp::new(filmcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        let route = |app: &mut FilmcraftApp, id| super::super::keyboard::route(app, &ctx, id, &serde_json::json!({})).unwrap();
+        route(&mut app, "effects.openSearch").unwrap();
+        route(&mut app, "view.fullScreenProgram").unwrap();
+        assert!(app.dialog.is_none(), "entering Cinema dismisses Effect Search");
+        assert!(route(&mut app, "effects.openSearch").is_err());
+        assert!(app.dialog.is_none(), "Effect Search must not hide the playback shortcuts in Cinema");
+        route(&mut app, "view.fullScreenProgram").unwrap();
+        route(&mut app, "effects.openSearch").unwrap();
+        assert_eq!(app.dialog, Some(crate::Dialog::EffectSearch));
     }
 
     #[test]

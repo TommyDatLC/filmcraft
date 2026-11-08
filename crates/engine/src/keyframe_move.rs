@@ -8,7 +8,7 @@ use filmcraft_time::Tick;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Result, Session, commands::bad};
+use crate::{EffectTarget, Result, Session, commands::bad, effect_target};
 
 const COMMAND: &str = "effects.moveKeyframes";
 const MAX_KEYS: usize = 4096;
@@ -16,7 +16,10 @@ const MAX_KEYS: usize = 4096;
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 struct Key {
-    clip: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clip: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    track: Option<u64>,
     effect: usize,
     param: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -24,11 +27,19 @@ struct Key {
     time: Tick,
 }
 
-type Lane = (u64, usize, Option<usize>, String);
+impl Key {
+    fn target(&self) -> Result<EffectTarget> {
+        match (self.clip, self.track) {
+            (Some(id), None) => Ok(EffectTarget::Clip(ClipId(id))),
+            (None, Some(id)) => Ok(EffectTarget::VideoTrack(filmcraft_project::TrackId(id))),
+            _ => Err(bad(COMMAND, "need exactly one clip or video track")),
+        }
+    }
+}
+type Lane = (EffectTarget, usize, Option<usize>, String);
 
 fn param_mut<'a>(sequence: &'a mut Sequence, lane: &Lane, command: &str) -> Result<&'a mut Param> {
-    let (_, it) = sequence.find_item_mut(ClipId(lane.0)).ok_or_else(|| bad(command, "clip does not exist"))?;
-    let effect = it.effects.get_mut(lane.1).ok_or_else(|| bad(command, "effect does not exist"))?;
+    let effect = effect_target::effects_mut(sequence, lane.0)?.get_mut(lane.1).ok_or_else(|| bad(command, "effect does not exist"))?;
     match lane.2 {
         Some(mask) => effect.masks.get_mut(mask).and_then(|m| m.param_mut(&lane.3)),
         None => effect.params.get_mut(&lane.3),
@@ -56,20 +67,44 @@ pub(crate) fn move_many(s: &mut Session, p: &Value) -> Result<Value> {
         if key.param.len() > 256 || !unique.insert(key.clone()) {
             return Err(bad(COMMAND, "duplicate or invalid keyframe reference"));
         }
-        let (_, it) = q.find_item(ClipId(key.clip)).ok_or_else(|| bad(COMMAND, "clip does not exist"))?;
-        let effect = it.effects.get(key.effect).ok_or_else(|| bad(COMMAND, "effect does not exist"))?;
+        let target = key.target()?;
+        if key.time.0.unsigned_abs() > filmcraft_project::ProjectView::MAX_PLAYHEAD.0 as u64 {
+            return Err(bad(COMMAND, "keyframe time outside supported bounds"));
+        }
+        let owner = match target {
+            EffectTarget::Clip(id) => q.find_item(id).map(|(track, _)| track),
+            EffectTarget::VideoTrack(id) => Some(id),
+        }
+        .and_then(|id| q.track(id))
+        .ok_or_else(|| bad(COMMAND, "effect target does not exist"))?;
+        if owner.locked {
+            return Err(bad(COMMAND, "track is locked"));
+        }
+        let effect = effect_target::effects(q, target)?.get(key.effect).ok_or_else(|| bad(COMMAND, "effect does not exist"))?;
+        if effect.effect == "dynamic_zoom" {
+            return Err(bad(COMMAND, "Dynamic Zoom has no keyframes"));
+        }
         let param = match key.mask {
             Some(mask) => effect.masks.get(mask).and_then(|m| m.param(&key.param)),
             None => effect.params.get(&key.param),
         }
         .ok_or_else(|| bad(COMMAND, "parameter does not exist"))?;
         let k = param.keyframes.iter().find(|k| k.time == key.time).ok_or_else(|| bad(COMMAND, "keyframe does not exist"))?;
-        let speed = direction(it);
-        if !speed.is_finite() || speed == 0.0 || it.duration < frame {
-            return Err(bad(COMMAND, "clip has no movable keyframe range"));
-        }
-        let a = it.moving_source_time_at(it.start);
-        let b = it.moving_source_time_at(it.end() - frame);
+        let (speed, a, b) = match target {
+            EffectTarget::Clip(id) => {
+                let (_, it) = q.find_item(id).ok_or_else(|| bad(COMMAND, "clip does not exist"))?;
+                if !it.speed.is_finite() || it.speed == 0.0 || it.duration < frame {
+                    return Err(bad(COMMAND, "clip has no movable keyframe range"));
+                }
+                (direction(it), it.moving_source_time_at(it.start), it.moving_source_time_at(it.end() - frame))
+            }
+            EffectTarget::VideoTrack(_) => {
+                if q.duration() < frame {
+                    return Err(bad(COMMAND, "sequence has no movable keyframe range"));
+                }
+                (1.0, Tick::ZERO, q.duration() - frame)
+            }
+        };
         if key.time < a.min(b) || key.time > a.max(b) {
             return Err(bad(COMMAND, "keyframe is outside the visible clip range"));
         }
@@ -91,7 +126,7 @@ pub(crate) fn move_many(s: &mut Session, p: &Value) -> Result<Value> {
         let from = key.time;
         k.time += Tick((delta as f64 * speed).round() as i64);
         key.time = k.time;
-        lanes.entry((key.clip, key.effect, key.mask, key.param.clone())).or_default().push((from, k));
+        lanes.entry((key.target()?, key.effect, key.mask, key.param.clone())).or_default().push((from, k));
     }
     s.edit_sequence("Move Keyframes", |sequence, _, _| {
         for (lane, moved) in lanes {
@@ -121,7 +156,7 @@ pub(crate) fn interpolate_many(s: &mut Session, p: &Value) -> Result<Value> {
     let kind = crate::commands::interpolation_p(p);
     s.edit_sequence("Keyframe Interpolation", |sequence, _, _| {
         for key in &keys {
-            let lane = (key.clip, key.effect, key.mask, key.param.clone());
+            let lane = (key.target()?, key.effect, key.mask, key.param.clone());
             let param = param_mut(sequence, &lane, SET)?;
             let k = param.keyframes.iter_mut().find(|k| k.time == key.time).ok_or_else(|| bad(SET, "keyframe does not exist"))?;
             k.interp = kind;

@@ -25,7 +25,10 @@ const ROW_H: f32 = 22.0;
 /// Whether an effect instance takes masks (video effects and Opacity; not Motion or graphic layers).
 pub fn maskable(e: &EffectInstance) -> bool {
     let Some(d) = e.def() else { return false };
-    d.kind == filmcraft_project::EffectKind::Video && (!d.intrinsic || e.effect == "opacity") && !filmcraft_project::graphic::is_layer(e)
+    d.kind == filmcraft_project::EffectKind::Video
+        && e.effect != "dynamic_zoom"
+        && (!d.intrinsic || e.effect == "opacity")
+        && !filmcraft_project::graphic::is_layer(e)
 }
 
 /// Mask rows under an effect in Effect Controls.
@@ -180,10 +183,9 @@ pub(crate) fn effect_rows(
 const LEFT: egui::PointerButton = egui::PointerButton::Primary;
 
 /// Clip pixels → screen points for the clip's current Motion and the monitor picture rect.
-fn clip_to_screen(app: &FilmcraftApp, it: &TrackItem, mt: Tick, pic: Rect, frame: (u32, u32)) -> Option<Affine> {
+fn clip_to_screen(app: &FilmcraftApp, it: &TrackItem, _mt: Tick, pic: Rect, frame: (u32, u32)) -> Option<Affine> {
     let seq = app.session.active_sequence()?;
-    let size = filmcraft_render::source_size(&app.session.project, it.item).unwrap_or(frame);
-    let motion = filmcraft_render::motion_matrix(seq, it, size, filmcraft_render::source_par(&app.session.project, it.item), mt);
+    let motion = filmcraft_render::dynamic_zoom::clip_matrix(&app.session.project, seq, it, app.session.playhead(), true)?;
     let view = Affine::translate(pic.min.x as f64, pic.min.y as f64)
         .then_apply(&Affine::scale(pic.width() as f64 / frame.0 as f64, pic.height() as f64 / frame.1 as f64));
     Some(view.then_apply(&motion))

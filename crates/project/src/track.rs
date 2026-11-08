@@ -316,6 +316,9 @@ pub struct Track {
     /// Track-level audio effects (mixer inserts, slots 1–5; `EffectInstance::post_fader` picks the side).
     #[serde(default)]
     pub effects: Vec<EffectInstance>,
+    /// Bypass track and owned clip video filters while retaining placement and opacity.
+    #[serde(default)]
+    pub video_effects_bypassed: bool,
     /// Audio Track Mixer state: automation mode and lanes, sends, output, record arm.
     #[serde(default)]
     pub mixer: MixerStrip,
@@ -341,6 +344,7 @@ impl Track {
             volume_db: 0.0,
             pan: 0.0,
             effects: Vec::new(),
+            video_effects_bypassed: false,
             mixer: MixerStrip::default(),
             label: None,
         }

@@ -14,6 +14,7 @@ pub mod audio_fx;
 pub mod blend;
 pub mod color_match;
 pub mod colorman;
+pub mod dynamic_zoom;
 pub mod effects;
 pub mod flow;
 pub mod gpufx;
@@ -34,6 +35,7 @@ mod stretch;
 pub mod track;
 pub mod transitions;
 pub mod vfx;
+mod video_track_fx;
 
 use std::sync::Arc;
 
@@ -243,34 +245,45 @@ fn seq_canvas(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, s
         if let Some(tr) = track.transitions.iter().find(|tr| tr.range().contains(t)) {
             let a = tr.from.and_then(|id| track.item(id)).filter(|i| i.enabled);
             let b = tr.to.and_then(|id| track.item(id)).filter(|i| i.enabled);
-            // An adjustment layer has no picture of its own: in a transition it is the frame below
-            // with its effects, so a dissolve fades the effects in or out.
-            let layer = |i: &TrackItem, below: &Image| -> Option<(Image, Blend)> {
-                if is_adjustment(project, i) {
-                    return opts.effects.then(|| adjustment_layer(project, seq, i, t, opts, &tc, below));
-                }
-                item_layer(project, seq, i, t, opts, sources, &tc).map(|(img, op, bl)| (with_opacity(img, op), bl))
-            };
+            // Adjustment layers keep the developer's backdrop transition behavior.
             let below = canvas.snapshot();
-            let la = a.and_then(|i| layer(i, &below));
-            let lb = b.and_then(|i| layer(i, &below));
-            // a fade from or to nothing keeps the one layer's blend mode (an adjustment layer in
-            // Multiply ends the fade as it carries on); between two layers they mix normally
-            let bl = match (&la, &lb) {
-                (Some((_, x)), None) | (None, Some((_, x))) => *x,
-                _ => Blend::Normal,
+            let layer = |i: &TrackItem| -> Option<(Image, Blend)> {
+                if is_adjustment(project, i) {
+                    return video_track_fx::clip_filters_enabled(track, opts).then(|| adjustment_layer(project, seq, (track, i), t, opts, &tc, &below));
+                }
+                item_layer(project, seq, i, t, opts, sources, &tc).map(|(image, opacity, blend)| (with_opacity(image, opacity), blend))
             };
-            let la = la.map(|l| l.0).unwrap_or_else(|| Image::new(w, h));
-            let lb = lb.map(|l| l.0).unwrap_or_else(|| Image::new(w, h));
-            let p = tr.progress(t) as f32;
-            // Reverse plays the transition backwards (e.g. an iris closing on the outgoing clip)
-            // while still going from A to B.
-            let mixed = if tr.reverse {
-                transitions::apply_scaled(&tr.effect, &lb, &la, 1.0 - p, opts.scale)
+            let rendered_a = a.and_then(layer);
+            let rendered_b = b.and_then(layer);
+            let mode_a = rendered_a.as_ref().map(|(_, mode)| *mode);
+            let mode_b = rendered_b.as_ref().map(|(_, mode)| *mode);
+            let common = match (mode_a, mode_b) {
+                (Some(a), Some(b)) if a != b => None,
+                _ => Some(mode_a.or(mode_b).unwrap_or(Blend::Normal)),
+            };
+            let la = rendered_a.map(|(image, _)| image).unwrap_or_else(|| Image::new(w, h));
+            let lb = rendered_b.map(|(image, _)| image).unwrap_or_else(|| Image::new(w, h));
+            let progress = tr.progress(t) as f32;
+            let mix = |a: &Image, b: &Image| {
+                if tr.reverse {
+                    transitions::apply_scaled(&tr.effect, b, a, 1.0 - progress, opts.scale)
+                } else {
+                    transitions::apply_scaled(&tr.effect, a, b, progress, opts.scale)
+                }
+            };
+            if let Some(mode) = common {
+                let mixed = mix(&la, &lb);
+                blend::composite(canvas.get(), &mixed, 1.0, mode);
             } else {
-                transitions::apply_scaled(&tr.effect, &la, &lb, p, opts.scale)
-            };
-            blend::composite(canvas.get(), &mixed, 1.0, bl);
+                // Different modes need their own backdrop contribution, kept
+                // separate until the original transition combines the branches.
+                let mut branch_a = canvas.snapshot();
+                let mut branch_b = branch_a.clone();
+                blend::composite(&mut branch_a, &la, 1.0, mode_a.unwrap_or(Blend::Normal));
+                blend::composite(&mut branch_b, &lb, 1.0, mode_b.unwrap_or(Blend::Normal));
+                let mixed = mix(&branch_a, &branch_b);
+                canvas.set(mixed);
+            }
             continue;
         }
         let Some(item) = track.item_at(t) else { continue };
@@ -278,11 +291,11 @@ fn seq_canvas(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, s
             continue;
         }
         if is_adjustment(project, item) {
-            if !opts.effects {
+            if !video_track_fx::clip_filters_enabled(track, opts) {
                 continue;
             }
             let below = canvas.snapshot();
-            let (adj, bl) = adjustment_layer(project, seq, item, t, opts, &tc, &below);
+            let (adj, bl) = adjustment_layer(project, seq, (track, item), t, opts, &tc, &below);
             if bl == Blend::Normal {
                 // The adjusted picture already replaces the original (see `adjustment_layer`).
                 canvas.set(adj);
@@ -338,7 +351,16 @@ fn is_adjustment(project: &Project, item: &TrackItem) -> bool {
 /// An adjustment layer as a layer over `below` (the composite of the tracks under it): `below`
 /// with the layer's effects, faded by its opacity and opacity masks and limited to its
 /// (Motion-transformed) frame, and the blend mode it mixes with.
-fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, opts: RenderOptions, tc: &str, below: &Image) -> (Image, Blend) {
+fn adjustment_layer(
+    project: &Project,
+    seq: &Sequence,
+    layer: (&filmcraft_project::Track, &TrackItem),
+    t: Tick,
+    opts: RenderOptions,
+    tc: &str,
+    below: &Image,
+) -> (Image, Blend) {
+    let (track, item) = layer;
     let (w, h) = (below.w, below.h);
     let mt = item.effect_time_at(t);
     let mut adj = below.clone();
@@ -356,6 +378,7 @@ fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick
     for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic)) {
         mask::apply_effect(&mut adj, e, &cx);
     }
+    video_track_fx::apply_track_stack(&mut adj, project, track, seq, t, opts);
     let (op, bl) = opacity_blend(item, mt);
     // Adjustment layer opacity (and opacity masks, in sequence pixels) weigh adjusted against original.
     let mut weight = Image::filled(w, h, [op; 4]);
@@ -541,16 +564,19 @@ pub(crate) fn item_layer_ex(
 ) -> Option<Layer> {
     let LayerWant { tc, allow_region } = want;
     let (w, h) = output_size(seq, opts.scale);
+    let track = seq.find_item(item.id).and_then(|(id, _)| seq.track(id));
+    let filters = track.map_or(opts.effects, |track| video_track_fx::clip_filters_enabled(track, opts));
+    let track_stack = track.is_some_and(|track| video_track_fx::has_stack(track, opts));
     // `mt`: where effects and Motion/Opacity are evaluated (differs from the shown frame's media
     // time inside a frame hold without Hold Filters).
     let mt = item.effect_time_at(t);
     let src_size = source_size(project, item.item)?;
-    let motion = motion_matrix(seq, item, src_size, source_par(project, item.item), mt);
+    let motion = dynamic_zoom::clip_matrix(project, seq, item, t, opts.effects)?;
     // How many output pixels one source pixel covers → request a reduced frame when possible.
     let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
     let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
     let pi = project.item(item.item)?;
-    if matches!(pi.kind, ItemKind::Graphic { .. }) && !(item.has_opacity_masks() || opts.effects && item.has_standard_effects()) {
+    if matches!(pi.kind, ItemKind::Graphic { .. }) && !track_stack && !(item.has_opacity_masks() || filters && item.has_standard_effects()) {
         // vectors straight to the output: no resampling, crisp at any Motion scale
         let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion);
         let mut canvas = Image::new(w, h);
@@ -560,7 +586,8 @@ pub(crate) fn item_layer_ex(
     }
     // plain media: nothing but the frame itself reaches the output
     let plain_media = matches!(pi.kind, ItemKind::Media(_) | ItemKind::Subclip { .. })
-        && !(opts.effects && item.has_standard_effects())
+        && !track_stack
+        && !(filters && item.has_standard_effects())
         && !item.effect("opacity").is_some_and(|e| e.enabled && !e.masks.is_empty());
     let mut fetched = None;
     if allow_region && plain_media {
@@ -586,7 +613,7 @@ pub(crate) fn item_layer_ex(
     let px_scale = layer.w as f32 / src_size.0.max(1) as f32;
     // layer px → source px → sequence px → output px
     let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
-    if opts.effects {
+    if filters {
         let env = vfx::ItemEnv { project, seq, item, t, opts, sources, want, layer_size: (layer.w, layer.h), layer_to_output: m, tc };
         let cx = effects::FxCtx {
             t: mt,
@@ -599,15 +626,29 @@ pub(crate) fn item_layer_ex(
             frame_rate: seq.settings.frame_rate.as_f64(),
             working: seq.settings.color.working,
         };
-        for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
+        for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e) && e.effect != "dynamic_zoom")
+        {
             if filmcraft_media::cancel::cancelled() {
                 return None;
             }
             mask::apply_effect(&mut layer, e, &cx);
         }
     }
-    mask::apply_opacity_masks(&mut layer, item, mt, px_scale);
-    let placed = if layer.w == w && layer.h == h && identity_placement(&m) { layer } else { layer.transformed(w, h, &m) };
+    let opacity_coverage = if track_stack && item.has_opacity_masks() {
+        let mut coverage = Image::filled(layer.w, layer.h, [1.0; 4]);
+        mask::apply_opacity_masks(&mut coverage, item, mt, px_scale);
+        Some(if layer.w == w && layer.h == h && identity_placement(&m) { coverage } else { coverage.transformed(w, h, &m) })
+    } else {
+        None
+    };
+    if !track_stack {
+        mask::apply_opacity_masks(&mut layer, item, mt, px_scale);
+    }
+    let mut placed = if layer.w == w && layer.h == h && identity_placement(&m) { layer } else { layer.transformed(w, h, &m) };
+    if let Some(track) = track.filter(|_| track_stack) {
+        video_track_fx::apply_track_stack(&mut placed, project, track, seq, t, opts);
+    }
+    video_track_fx::apply_clip_opacity_after_track(&mut placed, opacity_coverage);
     let (op, bl) = opacity_blend(item, mt);
     Some(Layer::Full { image: placed, opacity: op, blend: bl, opaque: false })
 }

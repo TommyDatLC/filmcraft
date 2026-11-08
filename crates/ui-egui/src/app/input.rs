@@ -106,7 +106,12 @@ impl FilmcraftApp {
     /// Remember the undo history as a mouse press begins, before any panel acts on it (a color
     /// picker sets its color on the press itself), for [`Self::cancel_value_drag`].
     pub(super) fn begin_press(&mut self, ctx: &egui::Context) {
-        match ctx.input(|i| i.pointer.press_start_time().filter(|_| i.pointer.any_down())) {
+        let press = ctx.input(|i| i.pointer.press_start_time().filter(|_| i.pointer.any_down()));
+        if press.is_some() && press == ctx.data(|d| d.get_temp::<f64>(egui::Id::unique("staged-pointer-press"))) {
+            self.value_press = None;
+            return;
+        }
+        match press {
             None => self.value_press = None,
             Some(p) if self.value_press.is_some_and(|(q, _)| q == p) => {}
             Some(p) => self.value_press = Some((p, self.session.undo_mark())),
@@ -118,6 +123,14 @@ impl FilmcraftApp {
         if ctx.input(|i| i.pointer.any_down() && i.key_pressed(egui::Key::Escape)) {
             self.escape_cancel = true;
         }
+    }
+
+    /// Draft-only gestures discard their draft on Escape without undoing another edit.
+    pub(crate) fn staged_pointer_drag(&mut self, ctx: &egui::Context) {
+        if let Some(press) = ctx.input(|i| i.pointer.press_start_time()) {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::unique("staged-pointer-press"), press));
+        }
+        self.value_press = None;
     }
 
     /// Escape while a mouse button is held takes back every edit this press made (#580): value

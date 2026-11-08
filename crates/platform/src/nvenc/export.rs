@@ -32,7 +32,7 @@ struct NvencEncoder {
     w: u32,
     h: u32,
     rate: FrameRate,
-    /// The stream's colour signal (`colr` / `mdcv` / `clli` on the sample entry for HDR).
+    /// The stream's colour signal (`colr`, plus `mdcv` / `clli` for PQ HDR).
     signal: ColorSignal,
     y: Vec<u8>,
     u: Vec<u8>,

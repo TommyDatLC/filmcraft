@@ -239,8 +239,8 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         if e.def().is_none_or(|d| d.kind != filmcraft_project::EffectKind::Video) {
             return Err(bad("masks.add", "masks apply to video effects"));
         }
-        if e.effect == "motion" {
-            return Err(bad("masks.add", "Motion has no masks"));
+        if matches!(e.effect.as_str(), "motion" | "dynamic_zoom") {
+            return Err(bad("masks.add", "fixed geometry stages have no masks"));
         }
         let n = e.masks.iter().filter_map(|m| m.name.strip_prefix("Mask (")?.strip_suffix(')')?.parse::<usize>().ok()).max().unwrap_or(0) + 1;
         let name = format!("Mask ({n})");

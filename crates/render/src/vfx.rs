@@ -34,6 +34,8 @@ use rayon::prelude::*;
 use crate::effects::FxCtx;
 use crate::image::Image;
 use crate::{RenderOptions, SourceProvider};
+mod resolve_custom;
+use filmcraft_project::ItemId;
 
 pub use temporal::{StabilizerPath, clear_stabilizer_cache, stabilizer_path};
 
@@ -46,8 +48,16 @@ pub trait FxEnv: Sync {
     fn source_frame(&self, dt: f64, scale: f32) -> Option<Image>;
     /// Video track `index` (0 = V1) rendered alone at this time, output-sized.
     fn track(&self, index: usize) -> Option<Image>;
+    /// An auxiliary media item at this clip's mapped source time, without its effects.
+    fn auxiliary_frame(&self, _item: ItemId) -> Option<Image> {
+        None
+    }
     /// Maps working-layer pixels to output pixels (Motion included).
     fn layer_to_output(&self) -> Affine;
+    /// Output pixels per full-resolution sequence pixel (preview/export resolution).
+    fn output_scale(&self) -> f32 {
+        1.0
+    }
     /// Clip duration on the timeline, in seconds.
     fn clip_seconds(&self) -> f64;
     /// Seconds from the clip's start to now.
@@ -129,8 +139,16 @@ impl FxEnv for ItemEnv<'_> {
         let o = RenderOptions { captions: false, working_output: true, depth: self.opts.depth + 1, ..self.opts };
         Some(crate::render_seq_tracks(self.project, self.seq, self.t, o, self.sources, Some(index)))
     }
+    fn auxiliary_frame(&self, item: ItemId) -> Option<Image> {
+        let mut surrogate = self.item.clone();
+        surrogate.item = item;
+        crate::base_layer(self.project, self.seq, &surrogate, self.t, self.opts, self.sources, self.want)
+    }
     fn layer_to_output(&self) -> Affine {
         self.layer_to_output
+    }
+    fn output_scale(&self) -> f32 {
+        self.opts.scale
     }
     fn clip_seconds(&self) -> f64 {
         self.item.duration.seconds()
@@ -455,6 +473,9 @@ pub(crate) fn clip_progress(cx: &FxCtx) -> f64 {
 
 /// Apply `e` if it is one of the effects implemented here; returns `false` for anything else.
 pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) -> bool {
+    if resolve_custom::apply(img, e, cx) {
+        return true;
+    }
     let alias = |img: &mut Image, base: &str| {
         let mut a = e.clone();
         a.effect = base.to_string();

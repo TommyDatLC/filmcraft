@@ -439,6 +439,13 @@ pub struct KeyframeRef {
     pub time: filmcraft_time::Tick,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DynamicZoomRectSelection {
+    #[default]
+    Start,
+    End,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
@@ -467,6 +474,8 @@ pub struct UiState {
     pub source: MonitorView,
     pub project_search: String,
     pub effects_search: String,
+    #[serde(default)]
+    pub effect_search: crate::panels::effects_search::SearchState,
     /// Expanded bins in the project list view.
     pub expanded_bins: Vec<u64>,
     /// Expanded folders in the Effects panel.
@@ -480,6 +489,12 @@ pub struct UiState {
     /// share of the panel). Dragging the divider sets it (#643).
     #[serde(default)]
     pub effect_controls_split: f32,
+    #[serde(default)]
+    pub dynamic_zoom_edit: Option<filmcraft_project::ClipId>,
+    #[serde(default)]
+    pub dynamic_zoom_active: DynamicZoomRectSelection,
+    #[serde(default = "shown")]
+    pub show_vignette_controls: bool,
     pub show_menu_bar: bool,
     /// The header bar (Home, Import, Edit, Export, workspaces). An app that embeds FilmCraft can hide it.
     #[serde(default = "shown")]
@@ -1017,11 +1032,15 @@ impl Default for UiState {
             source: MonitorView::default(),
             project_search: String::new(),
             effects_search: String::new(),
+            effect_search: Default::default(),
             expanded_bins: vec![],
             expanded_fx: vec!["Video Transitions".into(), "Video Transitions/Dissolve".into()],
             lumetri_grid_folder: None,
             collapsed_fx: vec![],
             effect_controls_split: 0.0,
+            dynamic_zoom_edit: None,
+            dynamic_zoom_active: DynamicZoomRectSelection::Start,
+            show_vignette_controls: true,
             show_menu_bar: true,
             show_header: true,
             show_status_bar: true,

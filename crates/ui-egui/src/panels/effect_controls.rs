@@ -165,6 +165,10 @@ fn drop_effect(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, clips: &[(
 }
 
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
+    if let Some(track) = super::effects_search::track_target(app) {
+        super::track_effect_controls::show(app, ui, rect, track);
+        return;
+    }
     let t = app.tokens;
     let clips = selected_clips(app);
     // keep only selected keyframes that still exist on a clip shown here
@@ -235,25 +239,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             bui.painter().text(pos2(hr.min.x + 8.0, hr.center().y), Align2::LEFT_CENTER, heading, Tokens::semibold(11.5), t.text_dim);
             // a graphic with Responsive Design – Time: its clip effects below keep media time (#3361)
             if *kind == TrackKind::Video && it.graphic.as_deref().is_some_and(|g| g.has_responsive_time()) {
-                let hint = tl!("Responsive Design – Time remaps the graphic's layer keyframes; clip effects like Opacity and Motion keep media time");
-                let ir = Rect::from_center_size(pos2(hr.max.x - 14.0, hr.center().y), vec2(18.0, 18.0));
-                // a small button: keyboard-focusable, with an accessible name, tooltip on hover or focus
-                let resp = bui.put(ir, egui::Button::new("").frame(false));
-                icons::paint(bui.painter(), ir.shrink(2.0), Icon::Info, t.text_dim);
-                if resp.ctx.has_accesskit_node(resp.id) {
-                    resp.ctx.accesskit_node_builder(resp.id, |node| node.set_label(hint));
-                }
-                if resp.has_focus() {
-                    resp.show_tooltip_text(hint);
-                } else {
-                    resp.on_hover_text(hint);
-                }
-                app.auto.add("effectControls.graphicTimeHint", ir, hint);
+                graphic_time_hint(app, bui, hr);
             }
             let mt_now = it.effect_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
             // Premiere lists the fixed effects (Motion, Opacity, Time Remapping / Volume…) first.
             let mut order: Vec<usize> = (0..it.effects.len()).collect();
-            order.sort_by_key(|i| !it.effects[*i].def().is_some_and(|d| d.intrinsic));
+            order.sort_by_key(|&i| match it.effects[i].effect.as_str() {
+                "motion" => 0,
+                "dynamic_zoom" => 1,
+                _ => 2 + u8::from(!it.effects[i].def().is_some_and(|d| d.intrinsic)),
+            });
             let mut after_fixed = false;
             for idx in order {
                 let e = &it.effects[idx];
@@ -268,7 +263,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 };
                 let key = format!("{}:{}", clip.0, idx);
                 let open = !app.ui.collapsed_fx.contains(&key);
-                let selected = app.session.state.selected_effect.as_ref().is_some_and(|s| s.clip == clip && s.index(&it.effects) == Some(idx));
+                let selected = app.session.state.selected_effect.as_ref().is_some_and(|s| s.clip() == Some(clip) && s.index(&it.effects) == Some(idx));
                 let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click());
                 if selected {
                     bui.painter().rect_filled(crate::panels::effect_controls::row_fill(r), 0.0, t.row_selected);
@@ -339,7 +334,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if crate::panels::audio_fx_editor::has_editor(&e.effect) {
                     custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
                 }
+                if e.effect == "dynamic_zoom" {
+                    super::dynamic_zoom_handles::controls(app, bui, body, clip, idx, e, &mut actions);
+                }
+                if e.effect == "vignette_blur" && selected {
+                    super::vignette_handles::controls(app, bui, body.width());
+                }
                 for pd in &def.params {
+                    if e.effect == "dynamic_zoom" && matches!(pd.id, "reverse" | "easing") {
+                        continue;
+                    }
                     param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, it, &mut keys);
                     if app.ui.expanded_fx.contains(&graph_key(clip, idx, pd.id))
                         && let Some(param) = e.params.get(pd.id)
@@ -398,6 +402,22 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     run(app, ui.ctx(), actions);
 }
 
+fn graphic_time_hint(app: &mut FilmcraftApp, ui: &mut egui::Ui, header: Rect) {
+    let hint = tl!("Responsive Design – Time remaps the graphic's layer keyframes; clip effects like Opacity and Motion keep media time");
+    let rect = Rect::from_center_size(pos2(header.max.x - 14.0, header.center().y), vec2(18.0, 18.0));
+    let response = ui.put(rect, egui::Button::new("").frame(false));
+    icons::paint(ui.painter(), rect.shrink(2.0), Icon::Info, app.tokens.text_dim);
+    if response.ctx.has_accesskit_node(response.id) {
+        response.ctx.accesskit_node_builder(response.id, |node| node.set_label(hint));
+    }
+    if response.has_focus() {
+        response.show_tooltip_text(hint);
+    } else {
+        response.on_hover_text(hint);
+    }
+    app.auto.add("effectControls.graphicTimeHint", rect, hint);
+}
+
 /// The thin line under a row, across the names, the values and the keyframe lane, so a row can be
 /// followed across the panel, as in Premiere (#640). It runs through the middle of the spacing
 /// between rows, so each row sits centred between its two lines.
@@ -422,6 +442,97 @@ pub(crate) fn row_label(ui: &egui::Ui, left_center: Pos2, text: &str, max_w: f32
 pub(crate) fn fit_to_row(ui: &mut egui::Ui) {
     ui.spacing_mut().interact_size.y = ROW_H - 4.0;
     ui.spacing_mut().button_padding.y = 1.0;
+}
+
+#[derive(Default)]
+pub(crate) struct ValueEdit {
+    pub value: Option<Value>,
+    pub dragging: bool,
+    pub begin: bool,
+}
+
+/// Value widgets have no clip/time assumptions. Callers own target routing and animation time.
+pub(crate) fn value_editor(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    pd: &filmcraft_project::ParamDef,
+    value: &ParamValue,
+    normalized: bool,
+) -> ValueEdit {
+    let t = app.tokens;
+    let mut edit = ValueEdit::default();
+    let mut numeric = |ui: &mut egui::Ui, part: &str, v, speed, range, decimals, unit| {
+        let label = if matches!(part, "x" | "y") {
+            format!("{} {}", crate::i18n::t(pd.label), part.to_ascii_uppercase())
+        } else {
+            crate::i18n::t(pd.label).to_string()
+        };
+        let (r, new) = crate::widgets::hot_number(ui, &label, id.with(part), v, HotNumberOptions::new(speed, range, decimals, unit, &t));
+        edit.dragging |= r.dragged();
+        edit.begin |= r.drag_started();
+        new
+    };
+    match (&pd.kind, value) {
+        (ParamKind::Float { min, max, soft_min, soft_max, unit, decimals }, ParamValue::Float(v)) => {
+            let digits = if *min >= 0.0 && *max <= 1.0 && unit.is_empty() { (*decimals as usize).max(3) } else { *decimals as usize };
+            edit.value = numeric(ui, "scalar", *v, ((soft_max - soft_min) / 400.0).max(0.01), (*min, *max), digits, unit).map(|v| json!(v));
+        }
+        (ParamKind::Angle, ParamValue::Float(v)) => edit.value = numeric(ui, "scalar", *v, 0.5, (-36000.0, 36000.0), 1, "°").map(|v| json!(v)),
+        (ParamKind::Point, ParamValue::Vec2(p)) => {
+            let (speed, range, decimals) = if normalized { (0.005, (-2.0, 3.0), 3) } else { (1.0, (-100000.0, 100000.0), 1) };
+            let x = numeric(ui, "x", p.x, speed, range, decimals, "");
+            let y = numeric(ui, "y", p.y, speed, range, decimals, "");
+            if x.is_some() || y.is_some() {
+                edit.value = Some(json!([x.unwrap_or(p.x), y.unwrap_or(p.y)]));
+            }
+        }
+        (ParamKind::Bool, ParamValue::Bool(v)) => {
+            let mut v = *v;
+            fit_to_row(ui);
+            if crate::widgets::accessible_name(ui.checkbox(&mut v, ""), crate::i18n::t(pd.label)).changed() {
+                edit.value = Some(json!(v));
+            }
+        }
+        (ParamKind::Choice(opts), ParamValue::Choice(c)) => {
+            let mut selected = *c as usize;
+            fit_to_row(ui);
+            let width = ui.available_width().min(130.0);
+            let combo =
+                craft_ui::ComboBox::from_id_salt(id).selected_text(opts.get(selected).map_or("", |s| crate::i18n::t(s))).width(width).show_ui(ui, |ui| {
+                    for (index, label) in opts.iter().enumerate() {
+                        if ui.selectable_value(&mut selected, index, crate::i18n::t(label)).changed() {
+                            edit.value = Some(json!(index));
+                        }
+                    }
+                });
+            crate::widgets::accessible_name(combo.response, crate::i18n::t(pd.label));
+        }
+        (ParamKind::Color, ParamValue::Color(c)) => {
+            let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+            if egui::color_picker::color_edit_button_rgba(ui, &mut rgba, egui::color_picker::Alpha::Opaque).changed() {
+                edit.value = Some(json!([rgba.r(), rgba.g(), rgba.b(), rgba.a()]));
+            }
+        }
+        (ParamKind::Text, ParamValue::Text(s)) if !pd.id.ends_with("_lut") => {
+            let mut buf = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| s.clone());
+            let r = crate::widgets::accessible_name(ui.add(egui::TextEdit::singleline(&mut buf).desired_width(160.0)), crate::i18n::t(pd.label));
+            if r.lost_focus() {
+                if buf != *s {
+                    edit.value = Some(json!(buf));
+                }
+                ui.data_mut(|d| d.remove::<String>(id));
+            } else if r.has_focus() {
+                ui.data_mut(|d| d.insert_temp(id, buf));
+            } else {
+                ui.data_mut(|d| d.remove::<String>(id));
+            }
+        }
+        _ => {
+            ui.label(param_text(&app.session.project, pd.id, value));
+        }
+    }
+    edit
 }
 
 /// Premiere's "Custom Setup ▸ Edit…" row: opens the effect's Clip Fx Editor window.
@@ -669,9 +780,12 @@ pub(crate) fn param_row(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     let id = egui::Id::unique(("pv", clip.0, idx, pkey));
-    let set = param_value_widget(app, &mut vui, e, pd, &value, clip, idx, mask, pkey, id, t, actions);
+    let response = clip_parameter_value(app, &mut vui, id, pd, &value, ClipParamTarget { clip, idx, mask, effect: e, key: pkey }, actions);
+    let gesture = (response.dragging, response.begin);
+    let set = response.value;
     if let Some(v) = set {
-        actions.push(("effects.setParam".into(), with_mask(json!({"clip": clip.0, "effect": idx, "param": pd.id, "value": v}))));
+        let params = with_mask(json!({"clip": clip.0, "effect": idx, "param": pd.id, "value": v}));
+        actions.push(("effects.setParam".into(), parameter_drag_params(params, &e.effect, gesture)));
     }
     // keyframe navigator ◀ ◆ ▶ (when animated)
     let eff_json = json!(idx);
@@ -720,195 +834,6 @@ pub(crate) fn param_row(
             });
         }
     }
-}
-
-/// The value editor of one parameter row: number, point, checkbox, choice, colour (with the
-/// eyedropper), path or text field. Returns the edited value, if any.
-#[allow(clippy::too_many_arguments)]
-fn param_value_widget(
-    app: &mut FilmcraftApp,
-    vui: &mut egui::Ui,
-    e: &EffectInstance,
-    pd: &filmcraft_project::ParamDef,
-    value: &ParamValue,
-    clip: ClipId,
-    idx: usize,
-    mask: Option<usize>,
-    pkey: &str,
-    id: egui::Id,
-    t: Tokens,
-    actions: &mut Vec<(String, Value)>,
-) -> Option<Value> {
-    let mut set: Option<Value> = None;
-    match (&pd.kind, value) {
-        (ParamKind::Float { min, max, soft_min, soft_max, unit, decimals }, ParamValue::Float(v)) => {
-            let speed = ((soft_max - soft_min) / 400.0).max(0.01);
-            let (_, nv) =
-                crate::widgets::hot_number(vui, crate::i18n::t(pd.label), id, *v, HotNumberOptions::new(speed, (*min, *max), *decimals as usize, unit, &t));
-            if let Some(nv) = nv {
-                set = Some(json!(nv));
-            }
-        }
-        (ParamKind::Angle, ParamValue::Float(v)) => {
-            let (_, nv) = crate::widgets::hot_number(vui, crate::i18n::t(pd.label), id, *v, HotNumberOptions::new(0.5, (-36000.0, 36000.0), 1, "°", &t));
-            if let Some(nv) = nv {
-                set = Some(json!(nv));
-            }
-        }
-        (ParamKind::Point, ParamValue::Vec2(p)) => {
-            let (_, nx) = crate::widgets::hot_number(
-                vui,
-                &format!("{} X", crate::i18n::t(pd.label)),
-                id.with("x"),
-                p.x,
-                HotNumberOptions::new(1.0, (-100_000.0, 100_000.0), 1, "", &t),
-            );
-            let (_, ny) = crate::widgets::hot_number(
-                vui,
-                &format!("{} Y", crate::i18n::t(pd.label)),
-                id.with("y"),
-                p.y,
-                HotNumberOptions::new(1.0, (-100_000.0, 100_000.0), 1, "", &t),
-            );
-            if nx.is_some() || ny.is_some() {
-                set = Some(json!([nx.unwrap_or(p.x), ny.unwrap_or(p.y)]));
-            }
-        }
-        (ParamKind::Bool, ParamValue::Bool(b)) => {
-            let mut v = *b;
-            fit_to_row(vui);
-            if crate::widgets::accessible_name(vui.checkbox(&mut v, ""), crate::i18n::t(pd.label)).changed() {
-                set = Some(json!(v));
-            }
-        }
-        (ParamKind::Choice(opts), ParamValue::Choice(c)) => {
-            let mut sel = *c as usize;
-            fit_to_row(vui);
-            // (narrower when the effect list is narrow, so it stays left of the divider)
-            let w = vui.available_width().min(130.0);
-            let combo = craft_ui::ComboBox::from_id_salt(id).selected_text(opts.get(sel).map_or("", |o| crate::i18n::t(o))).width(w).show_ui(vui, |ui| {
-                for (i, o) in opts.iter().enumerate() {
-                    if ui.selectable_value(&mut sel, i, crate::i18n::t(o)).changed() {
-                        set = Some(json!(i));
-                    }
-                }
-            });
-            crate::widgets::accessible_name(combo.response, crate::i18n::t(pd.label));
-        }
-        (ParamKind::Color, ParamValue::Color(c)) => {
-            let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-            if egui::color_picker::color_edit_button_rgba(vui, &mut rgba, egui::color_picker::Alpha::Opaque).changed() {
-                set = Some(json!([rgba.r(), rgba.g(), rgba.b(), rgba.a()]));
-            }
-            // Eyedropper: arm it, then click a pixel in the Program monitor (Esc cancels)
-            let target = crate::state::Eyedropper { clip: clip.0, effect: idx, param: pd.id.to_string(), mask };
-            let armed = app.ui.eyedropper.as_ref() == Some(&target);
-            let drop = icons::button(vui, Icon::Eyedropper, 18.0, armed, &t, tl!("Eyedropper (pick a color from the Program monitor)"));
-            app.auto.add(&format!("effectControls.{}.{}.eyedropper", e.effect, pkey), drop.rect, "Eyedropper");
-            if drop.clicked() {
-                app.ui.eyedropper = if armed { None } else { Some(target) };
-            }
-        }
-        (ParamKind::Path, _) => {
-            crate::panels::masks::path_value(app, vui, clip, idx, mask, actions);
-        }
-        // a text layer's Font and Font Style pick from the installed families and styles, as the
-        // Text panel's drop-downs do (#3539)
-        (ParamKind::Text, ParamValue::Text(current)) if e.effect == filmcraft_project::graphic::TEXT_LAYER && matches!(pd.id, "font" | "font_style") => {
-            if !filmcraft_text::fonts::system_scanned() {
-                filmcraft_text::fonts::scan_system();
-            }
-            let fams = filmcraft_text::families();
-            let salt = ("ec-font", clip.0, idx, pd.id);
-            // the value column can be narrower than the usual drop-down; keep the button inside it
-            let w = 150.0_f32.min(vui.available_width()).max(40.0);
-            let prefix = format!("effectControls.text.{}.{}.option", idx, pd.id);
-            let combo = if pd.id == "font" {
-                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(w).height(400.0).show_ui(vui, |ui| {
-                    for (f, _) in &fams {
-                        let r = ui.selectable_label(f == current, f);
-                        app.auto.add(&format!("{prefix}.{f}"), r.rect, f);
-                        if r.clicked() {
-                            set = Some(json!(f));
-                        }
-                    }
-                })
-            } else {
-                let family = match e.param("font").map(|p| &p.value) {
-                    Some(ParamValue::Text(f)) => f.as_str(),
-                    _ => "",
-                };
-                let mut styles: Vec<&str> =
-                    fams.iter().find(|(f, _)| f.eq_ignore_ascii_case(family)).map(|(_, s)| s.iter().map(String::as_str).collect()).unwrap_or_default();
-                for extra in ["Bold", "Italic", "Bold Italic"] {
-                    if !styles.contains(&extra) {
-                        styles.push(extra);
-                    }
-                }
-                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(w).show_ui(vui, |ui| {
-                    for st in styles {
-                        let r = ui.selectable_label(st == current, st);
-                        app.auto.add(&format!("{prefix}.{st}"), r.rect, st);
-                        if r.clicked() {
-                            set = Some(json!(st));
-                        }
-                    }
-                })
-            };
-            let r = crate::widgets::accessible_name(combo.response, crate::i18n::t(pd.label));
-            app.auto.add(&format!("effectControls.text.{}.{}", idx, pd.id), r.rect, pd.label);
-        }
-        (ParamKind::Text, ParamValue::Text(s)) if !pd.id.ends_with("_lut") => {
-            // edited in a buffer; committed (one undo step) when the field loses focus
-            let mut buf = vui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| s.clone());
-            let r = crate::widgets::accessible_name(vui.add(egui::TextEdit::singleline(&mut buf).desired_width(160.0)), crate::i18n::t(pd.label));
-            app.auto.add(&format!("effectControls.text.{}.{}", idx, pd.id), r.rect, pd.label);
-            crate::widgets::select_all_on_focus(vui, &r, &buf);
-            if r.lost_focus() {
-                if buf != *s {
-                    set = Some(json!(buf));
-                }
-                vui.data_mut(|d| d.remove::<String>(id));
-            } else if r.has_focus() {
-                vui.data_mut(|d| d.insert_temp(id, buf));
-            } else {
-                vui.data_mut(|d| d.remove::<String>(id));
-            }
-        }
-        // Lumetri's Input LUT / Look LUT: the Lumetri Color panel's menu (it showed only the name, #1123)
-        (ParamKind::Text, ParamValue::Text(cur)) => {
-            let input = pd.id == "input_lut";
-            let auto_id = format!("effectControls.{}.{}", e.effect, pkey);
-            let (rect, pick) = crate::panels::lumetri::lut_menu(vui, app, ("fx-lut", clip.0, idx, pkey), cur, input, 160.0, &auto_id);
-            app.auto.add(&auto_id, rect, pd.label);
-            match pick {
-                Some(crate::panels::lumetri::LutPick::Lut(r)) => set = Some(json!(r)),
-                Some(crate::panels::lumetri::LutPick::Browse) => {
-                    let (param, clip, mask, label) = (pd.id.to_string(), clip.0, mask, pd.label);
-                    app.pick_ui(crate::native_dialogs::FileDialog::open_file(tl!("LUT"), &["cube", "3dl"]), move |app, paths| {
-                        let Some(path) = paths.into_iter().next() else { return };
-                        // importing into the LUT library and setting the parameter undo as one step
-                        let r = app.session.edit_group(label, |s| {
-                            let r = s.execute("lut.import", json!({"path": path}))?["ref"].clone();
-                            let mut p = json!({"clip": clip, "effect": idx, "param": param, "value": r});
-                            if let Some(k) = mask {
-                                p["mask"] = json!(k);
-                            }
-                            s.execute("effects.setParam", p)
-                        });
-                        if let Err(err) = r {
-                            app.ui.status = err.to_string();
-                        }
-                    });
-                }
-                None => {}
-            }
-        }
-        _ => {
-            vui.label(param_text(&app.session.project, pd.id, value));
-        }
-    }
-    set
 }
 
 /// Shared by the lane diamonds and graph points: commands use media time and preserve the mask.
@@ -1554,6 +1479,167 @@ fn param_text(project: &filmcraft_project::Project, id: &str, value: &ParamValue
         ParamValue::Curve(pts) => tlf!("Custom ({n} points)", n = pts.len()),
         other => format!("{other:?}"),
     }
+}
+
+/// Dynamic Zoom value drags form one undo gesture while ordinary edits retain their behavior.
+fn parameter_drag_params(mut params: Value, effect: &str, gesture: (bool, bool)) -> Value {
+    if effect == "dynamic_zoom" && gesture.0 {
+        params["merge"] = json!(true);
+        params["begin"] = json!(gesture.1);
+    }
+    params
+}
+
+struct ClipParamTarget<'a> {
+    clip: ClipId,
+    idx: usize,
+    mask: Option<usize>,
+    effect: &'a EffectInstance,
+    key: &'a str,
+}
+
+fn clip_parameter_value(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    pd: &filmcraft_project::ParamDef,
+    value: &ParamValue,
+    target: ClipParamTarget<'_>,
+    actions: &mut Vec<(String, Value)>,
+) -> ValueEdit {
+    if matches!(pd.kind, ParamKind::Text) {
+        return clip_text_value(app, ui, id, pd, value, target);
+    }
+    let ClipParamTarget { clip, idx, mask, effect, key } = target;
+    let effect = effect.effect.as_str();
+    if matches!(pd.kind, ParamKind::Path) {
+        crate::panels::masks::path_value(app, ui, clip, idx, mask, actions);
+        return ValueEdit::default();
+    }
+    let response = value_editor(app, ui, id, pd, value, effect == "dynamic_zoom");
+    if matches!(pd.kind, ParamKind::Color) {
+        let eyedropper = crate::state::Eyedropper { clip: clip.0, effect: idx, param: pd.id.to_string(), mask };
+        let armed = app.ui.eyedropper.as_ref() == Some(&eyedropper);
+        let drop = icons::button(ui, Icon::Eyedropper, 18.0, armed, &app.tokens, tl!("Eyedropper (pick a color from the Program monitor)"));
+        app.auto.add(&format!("effectControls.{}.{}.eyedropper", effect, key), drop.rect, "Eyedropper");
+        if drop.clicked() {
+            app.ui.eyedropper = if armed { None } else { Some(eyedropper) };
+        }
+    }
+    if effect == "dynamic_zoom" {
+        app.auto.add(&format!("effectControls.dynamicZoom.param.{}", pd.id), ui.min_rect(), pd.label);
+    }
+    response
+}
+
+fn clip_text_value(
+    app: &mut FilmcraftApp,
+    vui: &mut egui::Ui,
+    id: egui::Id,
+    pd: &filmcraft_project::ParamDef,
+    value: &ParamValue,
+    target: ClipParamTarget<'_>,
+) -> ValueEdit {
+    let ClipParamTarget { clip, idx, mask, effect: e, key: pkey } = target;
+    let mut set = None;
+    match (&pd.kind, value) {
+        // a text layer's Font and Font Style pick from the installed families and styles, as the
+        // Text panel's drop-downs do (#3539)
+        (ParamKind::Text, ParamValue::Text(current)) if e.effect == filmcraft_project::graphic::TEXT_LAYER && matches!(pd.id, "font" | "font_style") => {
+            if !filmcraft_text::fonts::system_scanned() {
+                filmcraft_text::fonts::scan_system();
+            }
+            let fams = filmcraft_text::families();
+            let salt = ("ec-font", clip.0, idx, pd.id);
+            // the value column can be narrower than the usual drop-down; keep the button inside it
+            let w = 150.0_f32.min(vui.available_width()).max(40.0);
+            let prefix = format!("effectControls.text.{}.{}.option", idx, pd.id);
+            let combo = if pd.id == "font" {
+                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(w).height(400.0).show_ui(vui, |ui| {
+                    for (f, _) in &fams {
+                        let r = ui.selectable_label(f == current, f);
+                        app.auto.add(&format!("{prefix}.{f}"), r.rect, f);
+                        if r.clicked() {
+                            set = Some(json!(f));
+                        }
+                    }
+                })
+            } else {
+                let family = match e.param("font").map(|p| &p.value) {
+                    Some(ParamValue::Text(f)) => f.as_str(),
+                    _ => "",
+                };
+                let mut styles: Vec<&str> =
+                    fams.iter().find(|(f, _)| f.eq_ignore_ascii_case(family)).map(|(_, s)| s.iter().map(String::as_str).collect()).unwrap_or_default();
+                for extra in ["Bold", "Italic", "Bold Italic"] {
+                    if !styles.contains(&extra) {
+                        styles.push(extra);
+                    }
+                }
+                craft_ui::ComboBox::from_id_salt(salt).selected_text(current).width(w).show_ui(vui, |ui| {
+                    for st in styles {
+                        let r = ui.selectable_label(st == current, st);
+                        app.auto.add(&format!("{prefix}.{st}"), r.rect, st);
+                        if r.clicked() {
+                            set = Some(json!(st));
+                        }
+                    }
+                })
+            };
+            let r = crate::widgets::accessible_name(combo.response, crate::i18n::t(pd.label));
+            app.auto.add(&format!("effectControls.text.{}.{}", idx, pd.id), r.rect, pd.label);
+        }
+        (ParamKind::Text, ParamValue::Text(s)) if !pd.id.ends_with("_lut") => {
+            // edited in a buffer; committed (one undo step) when the field loses focus
+            let mut buf = vui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| s.clone());
+            let r = crate::widgets::accessible_name(vui.add(egui::TextEdit::singleline(&mut buf).desired_width(160.0)), crate::i18n::t(pd.label));
+            app.auto.add(&format!("effectControls.text.{}.{}", idx, pd.id), r.rect, pd.label);
+            crate::widgets::select_all_on_focus(vui, &r, &buf);
+            if r.lost_focus() {
+                if buf != *s {
+                    set = Some(json!(buf));
+                }
+                vui.data_mut(|d| d.remove::<String>(id));
+            } else if r.has_focus() {
+                vui.data_mut(|d| d.insert_temp(id, buf));
+            } else {
+                vui.data_mut(|d| d.remove::<String>(id));
+            }
+        }
+        // Lumetri's Input LUT / Look LUT: the Lumetri Color panel's menu (it showed only the name, #1123)
+        (ParamKind::Text, ParamValue::Text(cur)) => {
+            let input = pd.id == "input_lut";
+            let auto_id = format!("effectControls.{}.{}", e.effect, pkey);
+            let (rect, pick) = crate::panels::lumetri::lut_menu(vui, app, ("fx-lut", clip.0, idx, pkey), cur, input, 160.0, &auto_id);
+            app.auto.add(&auto_id, rect, pd.label);
+            match pick {
+                Some(crate::panels::lumetri::LutPick::Lut(r)) => set = Some(json!(r)),
+                Some(crate::panels::lumetri::LutPick::Browse) => {
+                    let (param, clip, mask, label) = (pd.id.to_string(), clip.0, mask, pd.label);
+                    app.pick_ui(crate::native_dialogs::FileDialog::open_file(tl!("LUT"), &["cube", "3dl"]), move |app, paths| {
+                        let Some(path) = paths.into_iter().next() else { return };
+                        // importing into the LUT library and setting the parameter undo as one step
+                        let r = app.session.edit_group(label, |s| {
+                            let r = s.execute("lut.import", json!({"path": path}))?["ref"].clone();
+                            let mut p = json!({"clip": clip, "effect": idx, "param": param, "value": r});
+                            if let Some(k) = mask {
+                                p["mask"] = json!(k);
+                            }
+                            s.execute("effects.setParam", p)
+                        });
+                        if let Err(err) = r {
+                            app.ui.status = err.to_string();
+                        }
+                    });
+                }
+                None => {}
+            }
+        }
+        _ => {
+            vui.label(param_text(&app.session.project, pd.id, value));
+        }
+    }
+    ValueEdit { value: set, ..Default::default() }
 }
 
 #[cfg(test)]

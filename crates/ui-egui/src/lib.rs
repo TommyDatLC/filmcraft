@@ -111,6 +111,7 @@ pub(crate) use native_dialogs::EXPORT_SAVE_DIALOGS;
 pub enum Dialog {
     About,
     Shortcuts,
+    EffectSearch,
     NewSequence,
     /// Settings (Preferences window; page in `UiState::settings`).
     Preferences,
