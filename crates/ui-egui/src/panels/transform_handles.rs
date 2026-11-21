@@ -149,7 +149,7 @@ fn placement(app: &FilmcraftApp, it: &TrackItem, e: &EffectInstance, mt: Tick, p
     let seq = app.session.active_sequence()?;
     let project = &app.session.project;
     let size = filmcraft_render::source_size(project, it.item).unwrap_or(frame);
-    let view = frame_to_screen(pic, frame);
+    let view = frame_to_screen(pic, frame).then_apply(&filmcraft_render::dynamic_zoom::stage_matrix(seq, it, app.session.playhead(), true));
     let motion = view.then_apply(&filmcraft_render::motion_matrix(seq, it, size, filmcraft_render::source_par(project, it.item), mt));
     // "auto" points (NaN) are where the render puts them
     let point = |id: &str, auto: Vec2| {
@@ -197,17 +197,19 @@ fn placement(app: &FilmcraftApp, it: &TrackItem, e: &EffectInstance, mt: Tick, p
 /// effect of a selected clip under the playhead.
 fn selected_effect(app: &FilmcraftApp) -> Option<(Target, &TrackItem, &EffectInstance, &'static EffectDef)> {
     let sel = app.session.state.selected_effect.as_ref()?;
-    if !app.session.state.selection.contains(&sel.clip) {
+    let clip = sel.clip()?;
+    if !app.session.state.selection.contains(&clip) {
         return None;
     }
     let seq = app.session.active_sequence()?;
-    let (_, it) = seq.find_item(sel.clip)?;
-    if !it.range().contains(app.session.playhead()) {
+    let ph = app.session.playhead();
+    let (_, it) = seq.find_item(clip)?;
+    if !it.range().contains(ph) {
         return None;
     }
     let index = sel.index(&it.effects)?;
     let e = it.effects.get(index).filter(|e| e.enabled)?;
-    Some(((sel.clip, index), it, e, e.def()?))
+    Some(((clip, index), it, e, e.def()?))
 }
 
 /// The selected effect (its clip and index) and its box, while it is Motion or Transform of a
@@ -519,7 +521,8 @@ fn clip_under(app: &FilmcraftApp, pic: Rect, frame: (u32, u32), p: Pos2) -> Opti
     let project = &app.session.project;
     seq.video_tracks.iter().rev().filter(|tr| tr.enabled).filter_map(|tr| tr.item_at(t)).filter(|it| it.enabled).find_map(|it| {
         let size = filmcraft_render::source_size(project, it.item).unwrap_or(frame);
-        let m = view.then_apply(&filmcraft_render::motion_matrix(seq, it, size, filmcraft_render::source_par(project, it.item), it.effect_time_at(t)));
+        let matrix = filmcraft_render::dynamic_zoom::clip_matrix(project, seq, it, t, true)?;
+        let m = view.then_apply(&matrix);
         inside(&quad_of(&m, size), p).then_some(it.id)
     })
 }

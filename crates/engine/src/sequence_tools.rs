@@ -542,15 +542,34 @@ fn comparable_master(project: &Project, it: &TrackItem) -> Option<(ItemId, Frame
 /// selected clips, or of everything on targeted tracks between In and Out, trimmed to In/Out when
 /// they are set. The new sequence is added to the project and selected; the original is unchanged.
 /// Give a sequence made from part of `from` (Nest…, Make Subsequence) the track names and audio
-/// channel layouts of `from`'s tracks, track for track.
+/// channel layouts of `from`'s tracks, track for track. Clip-filter bypass follows
+/// migrated clips; insert stacks need their own sequence-clock migration.
 pub(crate) fn lay_out_tracks_like(new: &mut filmcraft_project::Sequence, from: &filmcraft_project::Sequence) {
     for (tr, src) in new.video_tracks.iter_mut().zip(&from.video_tracks) {
         tr.name = src.name.clone();
+        tr.video_effects_bypassed = src.video_effects_bypassed;
     }
     for (tr, src) in new.audio_tracks.iter_mut().zip(&from.audio_tracks) {
         tr.name = src.name.clone();
         tr.channels = src.channels;
     }
+}
+
+/// Clip extraction cannot transfer inserts without rebasing their sequence clock
+/// and deciding whether a nest's parent would apply the same stack a second time.
+/// Refuse before starting an edit instead of losing effects or changing the image.
+pub(crate) fn validate_video_fx_extraction(q: &filmcraft_project::Sequence, items: &[(TrackKind, usize, TrackItem)]) -> Result<()> {
+    for (kind, index, _) in items {
+        if *kind == TrackKind::Video {
+            let track = q.video_tracks.get(*index).ok_or(EngineError::NoSequence)?;
+            if !track.effects.is_empty() {
+                return Err(EngineError::Other(
+                    "Extracting clips with video track effects is unsupported; duplicate the sequence to preserve its effect stacks".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Make Subsequence: copy the selected clips (with linked partners), or everything between In
@@ -587,6 +606,7 @@ fn make_subsequence(s: &mut Session, p: &Value) -> Result<Value> {
     if items.is_empty() {
         return Err(EngineError::Other("there are no clips between In and Out on the targeted tracks".into()));
     }
+    validate_video_fx_extraction(&q, &items)?;
     let offset = range.map(|r| r.start).unwrap_or_else(|| items.iter().map(|i| i.2.start).min().unwrap_or_default());
     let name = match str_p(p, "name") {
         Some(n) => n.to_string(),
@@ -614,7 +634,15 @@ fn make_subsequence(s: &mut Session, p: &Value) -> Result<Value> {
             }
             placed.push((kind, ti, it));
         }
-        let mut transitions = Vec::new();
+        {
+            let nq = pr.sequence_mut(nid).ok_or(EngineError::NoSequence)?;
+            lay_out_tracks_like(nq, &q);
+            for (kind, ti, it) in placed {
+                nq.tracks_mut(kind)[ti].items.push(it);
+            }
+        }
+        // Remap each transition directly into the assembled destination. Keep its
+        // endpoints tied to the copied clips rather than a second transfer buffer.
         for (kind, tracks) in [(TrackKind::Video, &q.video_tracks), (TrackKind::Audio, &q.audio_tracks)] {
             for (ti, tr) in tracks.iter().enumerate() {
                 for trn in &tr.transitions {
@@ -627,19 +655,14 @@ fn make_subsequence(s: &mut Session, p: &Value) -> Result<Value> {
                         t.from = from.flatten();
                         t.to = to.flatten();
                         t.start -= offset;
-                        transitions.push((kind, ti, t));
+                        let nq = pr.sequence_mut(nid).ok_or(EngineError::NoSequence)?;
+                        let track = nq.tracks_mut(kind).get_mut(ti).ok_or_else(|| EngineError::Other("subsequence destination track is missing".into()))?;
+                        track.transitions.push(t);
                     }
                 }
             }
         }
         let nq = pr.sequence_mut(nid).ok_or(EngineError::NoSequence)?;
-        lay_out_tracks_like(nq, &q);
-        for (kind, ti, it) in placed {
-            nq.tracks_mut(kind)[ti].items.push(it);
-        }
-        for (kind, ti, t) in transitions {
-            nq.tracks_mut(kind)[ti].transitions.push(t);
-        }
         for tr in nq.all_tracks_mut() {
             tr.sort();
         }
@@ -683,6 +706,9 @@ pub(crate) fn place_sequence_clips(s: &mut Session, placement: crate::commands::
             if clips.is_empty() {
                 continue;
             }
+            if kind == TrackKind::Video && !tr.effects.is_empty() {
+                return Err(bad(label, "This sequence has video track effects. Enable sequence-as-nest mode to preserve them."));
+            }
             lanes.insert((audio(kind), ti), lane);
             items.extend(clips.into_iter().map(|c| (kind, lane, c)));
             lane += 1;
@@ -711,23 +737,6 @@ pub(crate) fn place_sequence_clips(s: &mut Session, placement: crate::commands::
             }
             placed.push((kind, lane, it));
         }
-        let mut transitions = Vec::new();
-        for (kind, tracks) in [(TrackKind::Video, &src.video_tracks), (TrackKind::Audio, &src.audio_tracks)] {
-            for (ti, tr) in tracks.iter().enumerate() {
-                let Some(lane) = lanes.get(&(audio(kind), ti)).copied() else { continue };
-                for trn in &tr.transitions {
-                    let from = trn.from.map(|c| ids.get(&c).copied());
-                    let to = trn.to.map(|c| ids.get(&c).copied());
-                    if trn.start >= range.start && trn.end() <= range.end() && from != Some(None) && to != Some(None) {
-                        let mut t = trn.clone();
-                        t.id = filmcraft_project::TransitionId(p.alloc_id());
-                        (t.from, t.to) = (from.flatten(), to.flatten());
-                        t.start = at + (t.start - range.start);
-                        transitions.push((kind, lane, t));
-                    }
-                }
-            }
-        }
         // tracks for every lane, added on top when the sequence has too few
         let mut dest: std::collections::HashMap<(bool, usize), TrackId> = std::collections::HashMap::new();
         for (is_audio, lane) in placed.iter().map(|x| (audio(x.0), x.1)).collect::<std::collections::BTreeSet<_>>() {
@@ -753,9 +762,25 @@ pub(crate) fn place_sequence_clips(s: &mut Session, placement: crate::commands::
         let min = seq.settings.frame_rate.frame_duration();
         let mut ctx = edit::EditCtx { next_id: &mut next, media_duration: &durations, media_start: &starts, min_duration: min };
         let new = if insert { edit::insert(seq, placements, &mut ctx)? } else { edit::overwrite(seq, placements, &mut ctx)? };
-        for (kind, lane, t) in transitions {
-            if let Some(tr) = dest.get(&(audio(kind), lane)).and_then(|id| seq.track_mut(*id)) {
-                tr.transitions.push(t);
+        // Attach remapped transitions only after the clips have landed.
+        for (kind, tracks) in [(TrackKind::Video, &src.video_tracks), (TrackKind::Audio, &src.audio_tracks)] {
+            for (ti, tr) in tracks.iter().enumerate() {
+                let Some(lane) = lanes.get(&(audio(kind), ti)).copied() else { continue };
+                for trn in &tr.transitions {
+                    let from = trn.from.map(|c| ids.get(&c).copied());
+                    let to = trn.to.map(|c| ids.get(&c).copied());
+                    if trn.start >= range.start && trn.end() <= range.end() && from != Some(None) && to != Some(None) {
+                        let mut t = trn.clone();
+                        t.id = filmcraft_project::TransitionId(ctx.alloc());
+                        (t.from, t.to) = (from.flatten(), to.flatten());
+                        t.start = at + (t.start - range.start);
+                        let track = dest
+                            .get(&(audio(kind), lane))
+                            .and_then(|id| seq.track_mut(*id))
+                            .ok_or_else(|| EngineError::Other("sequence clip destination track is missing".into()))?;
+                        track.transitions.push(t);
+                    }
+                }
             }
         }
         for tr in seq.all_tracks_mut() {

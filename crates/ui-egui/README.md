@@ -1,5 +1,26 @@
 # FilmCraft interface
 
+Select a video track's label to edit its native effect stack. Shift+Space opens effect
+search for the selected target and shows the ten most recently applied effects. A track's
+FX button bypasses its inserts and direct clip filters together; eye/lock, intrinsic
+Motion, opacity/masks and Lighten remain independent. Bypass is undoable and saved.
+
+Nest/Make Subsequence preserve bypass on migrated clip-only tracks. Extraction from
+tracks with insert stacks reports an unsupported error rather than dropping effects,
+changing their sequence clock or double-applying a parent stack. Duplicate a complete
+sequence in the project panel to retain all track settings.
+
+Dynamic Zoom's **Edit Start / End** view shows two aspect-preserving viewports before the
+camera stage. Select Start or End, move the box or resize a corner, then choose Reverse
+and Linear/Ease In/Ease Out/Ease In-Out. Ordinary playback/export uses the camera result.
+Select a Vignette Blur instance and enable **Show Controls** to drag center, width, height,
+rotation or feather. Oval and rounded-rectangle guides use the renderer's mask geometry;
+clip coordinates include Motion, Dynamic Zoom and viewer zoom/pan, while track coordinates
+use the sequence frame. Bypassed guides appear dim and locked targets cannot be dragged.
+Both gizmos keep a draft outside the document during the gesture, commit once on release,
+and cancel safely on Escape or target changes. Numeric controls remain available when a
+singular transform prevents preview handles.
+
 The egui frontend draws panels and dialogs, and dispatches project changes through the engine.
 Interactive controls keep stable automation ids regardless of the interface language.
 
@@ -21,6 +42,23 @@ The warning is advisory: exporting one frame remains valid. Entire Source, Work 
 ranges do not show this warning. `export_ui::single_frame_in_out_warning_updates_with_range_and_marks`
 checks the warning and duration as marks and range selections change; the same test can render
 `export-single-frame-warning.png` with `FILMCRAFT_UI_SNAPSHOT_DIR`.
+
+## Quick effect search (local custom build)
+
+Shift+Space opens a centered effect search; Space retains Play/Pause when no text field or widget
+owns the key. Type a name, id, or folder to filter; Up/Down selects, Enter or a row click applies
+through `effects.apply`, and Escape or a backdrop click closes. Empty searches show the ten most
+recently applied effects before the alphabetical catalog. Successful applications from the normal
+Effects panel, drags, CLI, and MCP share the same history; failures and no-op applications do not.
+History persists in the `recentEffects` user preference and survives project Undo/Redo.
+
+`effects.openSearch` is a frontend command, exposed through the live control channel/MCP and the
+Keyboard Shortcuts editor. `ui.set {effectSearchQuery: "blur"}` changes the query. Automation ids:
+`effectSearch.query`, `.close`, `.recent`, `.item.<effect id>`, and `.message`.
+The FilmCraft Default key set uses this binding; other editor presets retain their own shortcuts
+and the command can be rebound. Selection errors remain visible in the search dialog.
+
+Regression tests: `effects_search_ui` and engine `effects_recent`.
 
 ## Control input limits
 

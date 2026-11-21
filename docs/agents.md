@@ -1,5 +1,15 @@
 # Agents
 
+Video track inserts are native engine state. Select a video track with
+`timeline.selectVideoTrack`, then use `effects.apply`/`effects.setParam` with an explicit
+`track` id or name. Keep `clip`/`clips` and `track` mutually exclusive. Inspect the actual
+ordered stack before targeting duplicate instances by index. Track keyframes use sequence
+time; clip keyframes use the clip effect clock. `timeline.setVideoFxBypass` toggles track
+and direct clip filters without rewriting their enabled flags, Motion or opacity/blend.
+See [the protocol](control-protocol.md#video-track-effects-and-preview-controls) for
+Dynamic Zoom, supported track effects and gizmo automation ids. Use a synthetic project
+for UI demonstrations; save the user's current project before upgrading the application.
+
 FilmCraft is built to be driven by AI agents, and largely built by them. Part 1 covers using
 FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 

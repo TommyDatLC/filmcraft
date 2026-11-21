@@ -35,8 +35,11 @@ pub fn visible_layers(app: &FilmcraftApp, pic: Rect, frame: (u32, u32)) -> Vec<L
         }
         let Some(ItemKind::Graphic { width, height, .. }) = app.session.project.item(it.item).map(|p| &p.kind) else { continue };
         let size = (*width, *height);
-        let mt = it.source_time_at(t);
-        let base = screen.then_apply(&filmcraft_render::motion_matrix(seq, it, size, None, mt));
+        let mt = it.effect_time_at(t);
+        let Some(matrix) = filmcraft_render::dynamic_zoom::clip_matrix(&app.session.project, seq, it, t, true) else {
+            continue;
+        };
+        let base = screen.then_apply(&matrix);
         let idx = layer_indices(&it.effects);
         for (li, &ei) in idx.iter().enumerate().rev() {
             if let Some(spec) = eval_layer(&it.effects[ei], mt, size).filter(|s| s.enabled) {
@@ -56,9 +59,10 @@ pub(super) fn canvas_target(app: &FilmcraftApp, pic: Rect, frame: (u32, u32)) ->
     if let Some((c, it)) = selected_graphic(app)
         && it.range().contains(t)
         && let Some(seq) = app.session.active_sequence()
-        && let Some(ItemKind::Graphic { width, height, .. }) = app.session.project.item(it.item).map(|p| &p.kind)
+        && let Some(ItemKind::Graphic { .. }) = app.session.project.item(it.item).map(|p| &p.kind)
+        && let Some(matrix) = filmcraft_render::dynamic_zoom::clip_matrix(&app.session.project, seq, &it, t, true)
     {
-        let m = screen.then_apply(&filmcraft_render::motion_matrix(seq, &it, (*width, *height), None, it.source_time_at(t)));
+        let m = screen.then_apply(&matrix);
         return (Some(c), m);
     }
     (None, screen)

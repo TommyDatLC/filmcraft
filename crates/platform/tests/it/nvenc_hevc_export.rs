@@ -261,19 +261,7 @@ fn hdr_is_main_10_where_the_gpu_has_10_bit_hevc_and_declined_where_it_has_not() 
     filmcraft_platform::register();
     let rate = FrameRate::FPS_24;
     let base = hevc(tmp("declined.mp4"));
-    // HDR (PQ / HLG) is taken as Main 10 where the GPU has 10-bit HEVC, declined (counted, with the reason) where it has not
-    for signal in [ColorSignal::PQ, ColorSignal::HLG] {
-        let before = hw_encode_stats();
-        let r = factory(Format::Hevc, 640, 360, rate, &ExportSettings { signal, ..base.clone() });
-        if filmcraft_platform::nvenc::hevc_hdr_available() {
-            assert!(matches!(r, Some(Ok(_))), "{signal:?}");
-            assert_eq!(delta(before), (0, 1, 0), "{signal:?}");
-        } else if hevc_available() {
-            let Some(Err(e)) = r else { panic!("{signal:?}: expected a declined request") };
-            assert!(e.to_string().contains("10-bit"), "{signal:?}: {e}");
-            assert_eq!(delta(before), (0, 0, 1), "{signal:?}");
-        }
-    }
+    assert_hdr_factory_support(&base, rate);
 }
 
 #[test]
@@ -346,4 +334,20 @@ fn the_factory_declines_odd_and_oversized_pictures_and_takes_a_good_one() {
     assert!(factory(Format::H264, 640, 360, rate, &off).is_none());
     assert!(matches!(factory(Format::Hevc, 640, 360, rate, &ExportSettings { hardware_encoding: HardwareEncoding::Off, ..base }), Some(Ok(_))));
     assert_eq!(delta(before), (0, 1, 0));
+}
+
+fn assert_hdr_factory_support(base: &ExportSettings, rate: FrameRate) {
+    // HDR (PQ / HLG) is taken as Main 10 where the GPU has 10-bit HEVC, declined (counted, with the reason) where it has not
+    for signal in [ColorSignal::PQ, ColorSignal::HLG] {
+        let before = hw_encode_stats();
+        let r = factory(Format::Hevc, 640, 360, rate, &ExportSettings { signal, ..base.clone() });
+        if filmcraft_platform::nvenc::hevc_hdr_available() {
+            assert!(matches!(r, Some(Ok(_))), "{signal:?}");
+            assert_eq!(delta(before), (0, 1, 0), "{signal:?}");
+        } else if hevc_available() {
+            let Some(Err(e)) = r else { panic!("{signal:?}: expected a declined request") };
+            assert!(e.to_string().contains("10-bit"), "{signal:?}: {e}");
+            assert_eq!(delta(before), (0, 0, 1), "{signal:?}");
+        }
+    }
 }

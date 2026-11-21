@@ -90,6 +90,28 @@ fn with_the_toggle_off_a_sequence_edits_in_as_its_clips_with_their_transitions()
 }
 
 #[test]
+fn placement_as_individual_clips_refuses_to_discard_source_track_effects() {
+    let mut s = demo();
+    let (source, target) = source_and_empty(&mut s);
+    s.execute("sequence.open", json!({"item": source.0})).unwrap();
+    let track = s.active_sequence().unwrap().video_tracks[0].id;
+    s.execute("effects.apply", json!({"track": track.0, "effect": "gaussian_blur"})).unwrap();
+    s.execute("sequence.open", json!({"item": target.0})).unwrap();
+    s.execute("sequence.nestSequences", json!({"on": false})).unwrap();
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+    let error = s.execute("timeline.place", json!({"item": source.0, "seconds": 0.0})).unwrap_err();
+    assert!(error.to_string().contains("video track effects"));
+    assert_eq!(*s.project, *before);
+    assert_eq!(s.history.undo.len(), undo);
+
+    s.execute("sequence.nestSequences", json!({"on": true})).unwrap();
+    s.execute("timeline.place", json!({"item": source.0, "seconds": 0.0})).unwrap();
+    assert_eq!(clips(&s, TrackKind::Video, 0)[0].item, source);
+    assert_eq!(s.project.sequence(source).unwrap().video_tracks[0].effects[0].effect, "gaussian_blur");
+}
+
+#[test]
 fn source_tracks_with_clips_go_to_consecutive_tracks_and_missing_tracks_are_added() {
     let mut s = demo();
     let (source, target) = source_and_empty(&mut s);
